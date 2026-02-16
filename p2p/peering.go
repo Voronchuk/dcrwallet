@@ -238,7 +238,7 @@ func (lp *LocalPeer) newMsgVersion(pver uint32, c net.Conn) (*wire.MsgVersion, e
 		return nil, err
 	}
 	v := wire.NewMsgVersion(la, ra, nonce, 0)
-	v.AddUserAgent(uaName, uaVersion)
+	_ = v.AddUserAgent(uaName, uaVersion)
 	v.ProtocolVersion = int32(pver)
 	v.DisableRelayTx = lp.disableRelayTx
 	return v, nil
@@ -300,7 +300,7 @@ func (lp *LocalPeer) ConnectOutbound(ctx context.Context, addr string, reqSvcs w
 	}
 
 	// Mark this as a good address.
-	lp.amgr.Good(na)
+	_ = lp.amgr.Good(na)
 
 	if lp.amgr.NeedMoreAddresses() {
 		err = rp.Addrs(ctx)
@@ -383,6 +383,9 @@ func (lp *LocalPeer) SeedPeers(ctx context.Context, services wire.ServiceFlag) {
 			resp, err := client.Do(req)
 			if err != nil {
 				log.Warnf("Failed to seed addresses from %s: %v", host, err)
+				if resp != nil {
+					resp.Body.Close()
+				}
 				resp = nil
 			}
 			resps <- resp
@@ -394,50 +397,52 @@ func (lp *LocalPeer) SeedPeers(ctx context.Context, services wire.ServiceFlag) {
 		if resp == nil {
 			continue
 		}
-		seeder := resp.Request.Host
-		var apiResponse struct {
-			Host     string `json:"host"`
-			Services uint64 `json:"services"`
-		}
-		dec := json.NewDecoder(io.LimitReader(resp.Body, 4096))
-		na = na[:0]
-		// Read at most 16 entries from each seeder, discard rest
-		for i := 0; i < 16; i++ {
-			err := dec.Decode(&apiResponse)
-			if errors.Is(err, io.EOF) {
-				break
+		func() {
+			defer resp.Body.Close()
+			seeder := resp.Request.Host
+			var apiResponse struct {
+				Host     string `json:"host"`
+				Services uint64 `json:"services"`
 			}
-			if err != nil {
-				log.Warnf("Invalid seeder %v API response: %v", seeder, err)
-				break
-			}
-			host, port, err := net.SplitHostPort(apiResponse.Host)
-			if err != nil {
-				log.Warnf("Invalid host in seeder %v API: %v", seeder, err)
-				continue
-			}
-			ip := net.ParseIP(host)
-			if ip == nil {
-				log.Warnf("Invalid IP address %q in seeder %v API host field",
-					host, seeder)
-				continue
-			}
-			portNum, err := strconv.ParseUint(port, 10, 16)
-			if err != nil {
-				log.Warnf("Invalid port %q in seeder %v API host field", port,
+			dec := json.NewDecoder(io.LimitReader(resp.Body, 4096))
+			na = na[:0]
+			// Read at most 16 entries from each seeder, discard rest
+			for i := 0; i < 16; i++ {
+				err := dec.Decode(&apiResponse)
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					log.Warnf("Invalid seeder %v API response: %v", seeder, err)
+					break
+				}
+				host, port, err := net.SplitHostPort(apiResponse.Host)
+				if err != nil {
+					log.Warnf("Invalid host in seeder %v API: %v", seeder, err)
+					continue
+				}
+				ip := net.ParseIP(host)
+				if ip == nil {
+					log.Warnf("Invalid IP address %q in seeder %v API host field",
+						host, seeder)
+					continue
+				}
+				portNum, err := strconv.ParseUint(port, 10, 16)
+				if err != nil {
+					log.Warnf("Invalid port %q in seeder %v API host field", port,
+						seeder)
+					continue
+				}
+				log.Debugf("Discovered peer %v from seeder %v", apiResponse.Host,
 					seeder)
-				continue
+				na = append(na, &addrmgr.NetAddress{
+					IP:        ip,
+					Port:      uint16(portNum),
+					Timestamp: time.Now(),
+					Services:  wire.ServiceFlag(apiResponse.Services),
+				})
 			}
-			log.Debugf("Discovered peer %v from seeder %v", apiResponse.Host,
-				seeder)
-			na = append(na, &addrmgr.NetAddress{
-				IP:        ip,
-				Port:      uint16(portNum),
-				Timestamp: time.Now(),
-				Services:  wire.ServiceFlag(apiResponse.Services),
-			})
-		}
-		resp.Body.Close()
+		}()
 		if len(na) > 0 {
 			lp.amgr.AddAddresses(na, na[0])
 		}
@@ -604,7 +609,7 @@ func handshake(ctx context.Context, lp *LocalPeer, id uint64, na *addrmgr.NetAdd
 	rp.initHeight = rversion.LastBlock
 	rp.services = rversion.Services
 	rp.ua = rversion.UserAgent
-	c.SetReadDeadline(time.Time{})
+	_ = c.SetReadDeadline(time.Time{})
 
 	// Negotiate protocol down to compatible version
 	if uint32(rversion.ProtocolVersion) < minPver {
@@ -630,7 +635,7 @@ func (lp *LocalPeer) connectOutbound(ctx context.Context, id uint64, addr string
 	na *addrmgr.NetAddress) (*RemotePeer, error) {
 
 	// Mark the connection attempt.
-	lp.amgr.Attempt(na)
+	_ = lp.amgr.Attempt(na)
 
 	// Dial with a timeout of 10 seconds.
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -640,7 +645,7 @@ func (lp *LocalPeer) connectOutbound(ctx context.Context, id uint64, addr string
 		return nil, err
 	}
 
-	lp.amgr.Connected(na)
+	_ = lp.amgr.Connected(na)
 
 	// Handshake with a timeout of 5s.
 	handshakeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

@@ -45,16 +45,16 @@ import (
 	"os"
 	"time"
 
-	"decred.org/dcrwallet/v3/errors"
-	_ "decred.org/dcrwallet/v3/wallet/internal/bdb"
-	"decred.org/dcrwallet/v3/wallet/udb"
-	"decred.org/dcrwallet/v3/wallet/walletdb"
-	"github.com/decred/dcrd/blockchain/stake"
-	"github.com/decred/dcrd/chaincfg"
+	"decred.org/dcrwallet/v5/errors"
+	_ "decred.org/dcrwallet/v5/wallet/drivers/bdb"
+	"decred.org/dcrwallet/v5/wallet/udb"
+	"decred.org/dcrwallet/v5/wallet/walletdb"
+	"github.com/decred/dcrd/blockchain/stake/v5"
+	"github.com/decred/dcrd/chaincfg/v3"
 	"github.com/decred/dcrd/chaincfg/chainhash"
-	"github.com/decred/dcrd/dcrutil"
-	"github.com/decred/dcrd/gcs"
-	"github.com/decred/dcrd/txscript"
+	"github.com/decred/dcrd/dcrutil/v4"
+	"github.com/decred/dcrd/gcs/v4"
+	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -256,6 +256,15 @@ func setup() error {
 			tx.AddTxOut(wire.NewTxOut(0, []byte{0x6a, 0x03, 0x00, 0x00, 0x00})) // vote bits
 			tx.AddTxOut(wire.NewTxOut(poolFee+poolFeeReward, pay2ssgen(poolFeeAddr)))
 			tx.AddTxOut(wire.NewTxOut(commitmentAmt+commitmentAmtReward, pay2ssgen(commitAddr)))
+
+			// Add SSFee consolidation address output (REQUIRED for current vote format)
+			// Use dummy hash160 (all zeros) for test database
+			dummyHash160 := make([]byte, 20)
+			consolidationOut, err := stake.CreateSSFeeConsolidationOutput(dummyHash160)
+			if err != nil {
+				return nil, err
+			}
+			tx.AddTxOut(consolidationOut)
 
 			return tx, nil
 		}

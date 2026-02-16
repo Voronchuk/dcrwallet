@@ -35,6 +35,7 @@ import (
 	blockchain "github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -136,8 +137,16 @@ type Wallet struct {
 	lockedOutpoints  map[outpoint]struct{}
 	lockedOutpointMu sync.Mutex
 
-	relayFee                   dcrutil.Amount
-	relayFeeMu                 sync.Mutex
+	relayFee      dcrutil.Amount
+	relayFeeMu    sync.Mutex
+	skaRelayFee   dcrutil.Amount
+	skaRelayFeeMu sync.Mutex
+
+	// Per-cointype fee management (manual overrides + static fallbacks)
+	manualFees map[cointype.CoinType]*dcrutil.Amount // nil = use RPC
+	staticFees map[cointype.CoinType]dcrutil.Amount  // config fallback
+	feesMu     sync.RWMutex
+
 	allowHighFees              bool
 	disableCoinTypeUpgrades    bool
 	recentlyPublished          map[chainhash.Hash]struct{}
@@ -757,6 +766,239 @@ func (w *Wallet) SetTSpendPolicy(ctx context.Context, tspendHash *chainhash.Hash
 	return nil
 }
 
+// SetVoteFeeConsolidationAddress sets the consolidation address for a specific
+// account. This address will be included in vote transactions to specify where
+// SSFee payments should be sent, enabling UTXO consolidation.
+//
+// The accountNameOrNumber parameter can be either an account name (string) or
+// account number (string representation of uint32).
+func (w *Wallet) SetVoteFeeConsolidationAddress(ctx context.Context,
+	accountNameOrNumber string, address stdaddr.Address) error {
+
+	const op errors.Op = "wallet.SetVoteFeeConsolidationAddress"
+
+	// Extract hash160 from the address
+	hash160er, ok := address.(stdaddr.Hash160er)
+	if !ok {
+		return errors.E(op, errors.Invalid,
+			"address must be P2PKH-compatible (provide hash160)")
+	}
+	hash160 := hash160er.Hash160()
+	if hash160 == nil || len(*hash160) != 20 {
+		return errors.E(op, errors.Invalid, "invalid address hash160")
+	}
+
+	// Resolve account name from name or number
+	accountName, err := w.resolveAccountName(ctx, accountNameOrNumber)
+	if err != nil {
+		return errors.E(op, err)
+	}
+
+	// Store the consolidation address in the database
+	err = walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		return udb.SetAccountConsolidationAddr(dbtx, accountName, (*hash160)[:])
+	})
+	if err != nil {
+		return errors.E(op, err)
+	}
+
+	return nil
+}
+
+// GetVoteFeeConsolidationAddress retrieves the consolidation address for a
+// specific account. If no custom address has been set, this returns the first
+// external address (index 0) for the account as the default.
+//
+// The accountNameOrNumber parameter can be either an account name (string) or
+// account number (string representation of uint32).
+func (w *Wallet) GetVoteFeeConsolidationAddress(ctx context.Context,
+	accountNameOrNumber string) (stdaddr.Address, error) {
+
+	const op errors.Op = "wallet.GetVoteFeeConsolidationAddress"
+
+	// Resolve account name from name or number
+	accountName, err := w.resolveAccountName(ctx, accountNameOrNumber)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	var hash160 []byte
+	err = walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		// Try to get custom consolidation address
+		customHash160, err := udb.GetAccountConsolidationAddr(dbtx, accountName)
+		if err != nil {
+			return err
+		}
+
+		if customHash160 != nil {
+			// Custom address is set
+			hash160 = customHash160
+			return nil
+		}
+
+		// No custom address - get the first external address (index 0) as default
+		hash160, err = w.getFirstExternalAddressHash160(dbtx, accountName)
+		return err
+	})
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Convert hash160 to address
+	addr, err := stdaddr.NewAddressPubKeyHashEcdsaSecp256k1V0(hash160, w.chainParams)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	return addr, nil
+}
+
+// ClearVoteFeeConsolidationAddress clears the custom consolidation address for
+// a specific account, causing it to revert to the default (first external address).
+//
+// The accountNameOrNumber parameter can be either an account name (string) or
+// account number (string representation of uint32).
+func (w *Wallet) ClearVoteFeeConsolidationAddress(ctx context.Context,
+	accountNameOrNumber string) error {
+
+	const op errors.Op = "wallet.ClearVoteFeeConsolidationAddress"
+
+	// Resolve account name from name or number
+	accountName, err := w.resolveAccountName(ctx, accountNameOrNumber)
+	if err != nil {
+		return errors.E(op, err)
+	}
+
+	// Clear the consolidation address from the database
+	err = walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		return udb.ClearAccountConsolidationAddr(dbtx, accountName)
+	})
+	if err != nil {
+		return errors.E(op, err)
+	}
+
+	return nil
+}
+
+// HasCustomConsolidationAddress checks if a custom consolidation address is set
+// for the specified account. Returns true if a custom address is set, false if
+// using the default address.
+func (w *Wallet) HasCustomConsolidationAddress(ctx context.Context,
+	accountNameOrNumber string) (bool, error) {
+
+	const op errors.Op = "wallet.HasCustomConsolidationAddress"
+
+	// Resolve account name from name or number
+	accountName, err := w.resolveAccountName(ctx, accountNameOrNumber)
+	if err != nil {
+		return false, errors.E(op, err)
+	}
+
+	var hasCustom bool
+	err = walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		customAddr, err := udb.GetAccountConsolidationAddr(dbtx, accountName)
+		hasCustom = (customAddr != nil && err == nil)
+		return nil
+	})
+	if err != nil {
+		return false, errors.E(op, err)
+	}
+
+	return hasCustom, nil
+}
+
+// resolveAccountName converts an account name or number string to an account name.
+// If the input is a number, it looks up the corresponding account name.
+// If the input is already a name, it validates that the account exists.
+func (w *Wallet) resolveAccountName(ctx context.Context, nameOrNumber string) (string, error) {
+	const op errors.Op = "wallet.resolveAccountName"
+
+	// Try to parse as account number
+	var accountNumber uint32
+	_, err := fmt.Sscanf(nameOrNumber, "%d", &accountNumber)
+	if err == nil {
+		// It's a number - look up the account name
+		name, err := w.AccountName(ctx, accountNumber)
+		if err != nil {
+			return "", errors.E(op, err)
+		}
+		return name, nil
+	}
+
+	// It's a name - validate that the account exists
+	err = walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
+		_, err := w.manager.LookupAccount(addrmgrNs, nameOrNumber)
+		return err
+	})
+	if err != nil {
+		return "", errors.E(op, err)
+	}
+
+	return nameOrNumber, nil
+}
+
+// getFirstExternalAddressHash160 retrieves the hash160 of the first external
+// address (index 0) for a specific account. This is used as the default
+// consolidation address when no custom address has been set.
+func (w *Wallet) getFirstExternalAddressHash160(dbtx walletdb.ReadTx,
+	accountName string) ([]byte, error) {
+
+	const op errors.Op = "wallet.getFirstExternalAddressHash160"
+
+	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
+
+	// Look up account number by name
+	accountNumber, err := w.manager.LookupAccount(addrmgrNs, accountName)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Get the account extended public key
+	acctXpub, err := w.manager.AccountExtendedPubKey(dbtx, accountNumber)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Get the external branch extended public key
+	extXpub, err := acctXpub.Child(udb.ExternalBranch)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Derive the first address (index 0)
+	addr0Xpub, err := extXpub.Child(0)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Get the public key
+	pubKey := addr0Xpub.SerializedPubKey()
+
+	// Calculate hash160 (RIPEMD160(SHA256(pubKey)))
+	addr, err := stdaddr.NewAddressPubKeyEcdsaSecp256k1V0Raw(pubKey, w.chainParams)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Convert to P2PKH address which implements Hash160er
+	pkh := addr.AddressPubKeyHash()
+	hash160er, ok := pkh.(stdaddr.Hash160er)
+	if !ok {
+		return nil, errors.E(op, errors.IO, "failed to extract hash160 from address")
+	}
+
+	hash160 := hash160er.Hash160()
+	if hash160 == nil || len(*hash160) != 20 {
+		return nil, errors.E(op, errors.IO, "invalid hash160 from first external address")
+	}
+
+	// Return a copy
+	result := make([]byte, 20)
+	copy(result, (*hash160)[:])
+	return result, nil
+}
+
 // VSPMaxFee is the maximum fee to pay when registering a ticket with a VSP.
 func (w *Wallet) VSPMaxFee() dcrutil.Amount {
 	return w.vspMaxFee
@@ -764,19 +1006,164 @@ func (w *Wallet) VSPMaxFee() dcrutil.Amount {
 
 // RelayFee returns the current minimum relay fee (per kB of serialized
 // transaction) used when constructing transactions.
+// This method uses the 3-tier priority system (manual > RPC > static).
 func (w *Wallet) RelayFee() dcrutil.Amount {
-	w.relayFeeMu.Lock()
-	relayFee := w.relayFee
-	w.relayFeeMu.Unlock()
-	return relayFee
+	fee, _, err := w.GetEffectiveFee(context.Background(), cointype.CoinTypeVAR)
+	if err != nil {
+		log.Warnf("Failed to get effective fee for VAR: %v, using static fallback", err)
+		w.relayFeeMu.Lock()
+		relayFee := w.relayFee
+		w.relayFeeMu.Unlock()
+		return relayFee
+	}
+	return fee
 }
 
 // SetRelayFee sets a new minimum relay fee (per kB of serialized
 // transaction) used when constructing transactions.
+// This updates both the old relayFee field and the new static fees map.
 func (w *Wallet) SetRelayFee(relayFee dcrutil.Amount) {
 	w.relayFeeMu.Lock()
 	w.relayFee = relayFee
 	w.relayFeeMu.Unlock()
+
+	// Also update static fee map for the new fee system
+	w.feesMu.Lock()
+	w.staticFees[cointype.CoinTypeVAR] = relayFee
+	w.feesMu.Unlock()
+}
+
+// SKARelayFee returns the current minimum relay fee (per kB of serialized
+// transaction) used when constructing SKA transactions.
+// This method uses the 3-tier priority system (manual > RPC > static).
+// Returns fee for the first active SKA coin type.
+func (w *Wallet) SKARelayFee() dcrutil.Amount {
+	// Get first active SKA coin type from chain params
+	for ct, config := range w.chainParams.SKACoins {
+		if config != nil && config.Active {
+			fee, _, err := w.GetEffectiveFee(context.Background(), ct)
+			if err != nil {
+				log.Warnf("Failed to get effective fee for SKA coin type %d: %v, using static fallback", ct, err)
+				w.skaRelayFeeMu.Lock()
+				skaRelayFee := w.skaRelayFee
+				w.skaRelayFeeMu.Unlock()
+				return skaRelayFee
+			}
+			return fee
+		}
+	}
+	// Fallback if no active SKA coins
+	w.skaRelayFeeMu.Lock()
+	skaRelayFee := w.skaRelayFee
+	w.skaRelayFeeMu.Unlock()
+	return skaRelayFee
+}
+
+// SetSKARelayFee sets a new minimum relay fee (per kB of serialized
+// transaction) used when constructing SKA transactions.
+// This updates both the old skaRelayFee field and the static fees map for all active SKA coins.
+func (w *Wallet) SetSKARelayFee(skaRelayFee dcrutil.Amount) {
+	w.skaRelayFeeMu.Lock()
+	w.skaRelayFee = skaRelayFee
+	w.skaRelayFeeMu.Unlock()
+
+	// Also update static fee map for all active SKA coins
+	w.feesMu.Lock()
+	if w.chainParams != nil && w.chainParams.SKACoins != nil {
+		for ct, config := range w.chainParams.SKACoins {
+			if config != nil && config.Active {
+				w.staticFees[ct] = skaRelayFee
+			}
+		}
+	} else {
+		// Fallback: update only existing SKA coin types in the map
+		for ct := range w.staticFees {
+			if ct != cointype.CoinTypeVAR {
+				w.staticFees[ct] = skaRelayFee
+			}
+		}
+	}
+	w.feesMu.Unlock()
+}
+
+// SetManualFee sets a manual fee override for the specified coin type.
+// This fee takes priority over RPC-queried dynamic fees.
+func (w *Wallet) SetManualFee(ct cointype.CoinType, fee dcrutil.Amount) {
+	w.feesMu.Lock()
+	w.manualFees[ct] = &fee
+	w.feesMu.Unlock()
+
+	// Also update old fields for backward compatibility
+	if ct == cointype.CoinTypeVAR {
+		w.SetRelayFee(fee)
+	} else {
+		w.SetSKARelayFee(fee)
+	}
+}
+
+// ClearManualFee removes manual fee override for the specified coin type,
+// reverting to RPC-based dynamic fee estimation.
+func (w *Wallet) ClearManualFee(ct cointype.CoinType) {
+	w.feesMu.Lock()
+	delete(w.manualFees, ct)
+	w.feesMu.Unlock()
+}
+
+// queryDynamicFee queries dcrd RPC for current dynamic fee estimate
+func (w *Wallet) queryDynamicFee(ctx context.Context, ct cointype.CoinType) (dcrutil.Amount, error) {
+	n, err := w.NetworkBackend()
+	if err != nil {
+		return 0, err
+	}
+
+	estimates, err := n.GetFeeEstimatesByCoinType(ctx, uint8(ct))
+	if err != nil {
+		return 0, err
+	}
+
+	// Use normal fee (already includes dynamic multiplier)
+	return dcrutil.NewAmount(estimates.NormalFee)
+}
+
+// GetEffectiveFee returns the fee that will actually be used for transactions.
+// Priority: manual override > RPC dynamic fee > static config fee
+// Returns the fee amount, source ("manual", "rpc", or "static"), and any error.
+func (w *Wallet) GetEffectiveFee(ctx context.Context, ct cointype.CoinType) (dcrutil.Amount, string, error) {
+	w.feesMu.RLock()
+	manual := w.manualFees[ct]
+	static, hasStatic := w.staticFees[ct]
+	w.feesMu.RUnlock()
+
+	// Priority 1: Manual override
+	if manual != nil {
+		return *manual, "manual", nil
+	}
+
+	// Priority 2: RPC dynamic fee
+	if fee, err := w.queryDynamicFee(ctx, ct); err == nil {
+		return fee, "rpc", nil
+	}
+
+	// Priority 3: Static fallback
+	if hasStatic {
+		return static, "static", nil
+	}
+
+	return 0, "static", errors.Errorf("no fee configured for coin type %d", ct)
+}
+
+// RelayFeeForCoinType returns the effective relay fee for the specified coin type.
+// This method now queries dynamic fees from dcrd by default, unless manually overridden.
+func (w *Wallet) RelayFeeForCoinType(ctx context.Context, ct cointype.CoinType) dcrutil.Amount {
+	fee, _, err := w.GetEffectiveFee(ctx, ct)
+	if err != nil {
+		log.Warnf("Failed to get effective fee for coin type %d: %v", ct, err)
+		w.feesMu.RLock()
+		static := w.staticFees[ct]
+		w.feesMu.RUnlock()
+		return static
+	}
+	return fee
 }
 
 // InitialHeight is the wallet's tip height prior to syncing with the network.
@@ -791,7 +1178,7 @@ func (w *Wallet) MainChainTip(ctx context.Context) (hash chainhash.Hash, height 
 	// should be saved in memory.  This will speed up access to it, and means
 	// there won't need to be an ignored error here for ergonomic access to the
 	// hash and height.
-	walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+	_ = walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
 		hash, height = w.txStore.MainChainTip(dbtx)
 		return nil
 	})
@@ -1175,7 +1562,7 @@ func (w *Wallet) LoadActiveDataFilters(ctx context.Context, n NetworkBackend, re
 	defer w.lockedOutpointMu.Unlock()
 	w.lockedOutpointMu.Lock()
 	err = walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
-		err := w.txStore.ForEachUnspentOutpoint(dbtx, watchOutPoint)
+		err := w.txStore.ForEachUnspentOutpoint(dbtx, nil, watchOutPoint) // nil = all coin types
 		if err != nil {
 			return err
 		}
@@ -1544,13 +1931,22 @@ func (w *Wallet) blockLocators(dbtx walletdb.ReadTx, sidechain []*BlockNode) ([]
 // If that many UTXOs can not be found, it will use the maximum it finds. This
 // will only compress UTXOs in the default account
 func (w *Wallet) Consolidate(ctx context.Context, inputs int, account uint32, address stdaddr.Address) (*chainhash.Hash, error) {
-	return w.compressWallet(ctx, "wallet.Consolidate", inputs, account, address)
+	// Default to VAR for consolidation
+	return w.compressWallet(ctx, "wallet.Consolidate", inputs, account, address, cointype.CoinTypeVAR)
+}
+
+// ConsolidateWithCoinType consolidates as many UTXOs as are passed in the inputs argument
+// for a specific coin type. If that many UTXOs can not be found, it will use the maximum
+// it finds. This will only compress UTXOs in the specified account.
+func (w *Wallet) ConsolidateWithCoinType(ctx context.Context, inputs int, account uint32, address stdaddr.Address, ct cointype.CoinType) (*chainhash.Hash, error) {
+	return w.compressWallet(ctx, "wallet.ConsolidateWithCoinType", inputs, account, address, ct)
 }
 
 // CreateMultisigTx creates and signs a multisig transaction.
 func (w *Wallet) CreateMultisigTx(ctx context.Context, account uint32, amount dcrutil.Amount,
 	pubkeys [][]byte, nrequired int8, minconf int32) (*CreatedTx, stdaddr.Address, []byte, error) {
-	return w.txToMultisig(ctx, "wallet.CreateMultisigTx", account, amount, pubkeys, nrequired, minconf)
+	// Default to VAR for multisig transactions
+	return w.txToMultisig(ctx, "wallet.CreateMultisigTx", account, amount, pubkeys, nrequired, minconf, cointype.CoinTypeVAR)
 }
 
 // PurchaseTicketsRequest describes the parameters for purchasing tickets.
@@ -1898,18 +2294,11 @@ func (w *Wallet) ChangePublicPassphrase(ctx context.Context, old, new []byte) er
 	return nil
 }
 
-// Balances describes a breakdown of an account's balances in various
-// categories.
-type Balances struct {
-	Account                 uint32
-	ImmatureCoinbaseRewards dcrutil.Amount
-	ImmatureStakeGeneration dcrutil.Amount
-	LockedByTickets         dcrutil.Amount
-	Spendable               dcrutil.Amount
-	Total                   dcrutil.Amount
-	VotingAuthority         dcrutil.Amount
-	Unconfirmed             dcrutil.Amount
-}
+// Balances type alias for udb.Balances to maintain backward compatibility
+type Balances = udb.Balances
+
+// CoinBalance type alias for udb.CoinBalance to maintain backward compatibility
+type CoinBalance = udb.CoinBalance
 
 // AccountBalance returns the balance breakdown for a single account.
 func (w *Wallet) AccountBalance(ctx context.Context, account uint32, confirms int32) (Balances, error) {
@@ -1949,6 +2338,182 @@ func (w *Wallet) AccountBalances(ctx context.Context, confirms int32) ([]Balance
 	return balances, nil
 }
 
+// AccountBalanceByCoinType returns the balance breakdown for a specific coin type within an account.
+// It separates VAR (CoinType 0) from SKA coins (CoinType 1-255) and provides detailed
+// breakdown of spendable, immature, and locked amounts for the requested coin type only.
+//
+// Parameters:
+//   - account: The account number to query (0 for default account)
+//   - coinType: The specific coin type (0=VAR, 1-255=SKA variants)
+//   - confirms: Minimum confirmations required for inclusion in balance calculation
+//
+// Returns CoinBalance with detailed breakdown for the specified coin type, or empty
+// CoinBalance if the account contains no funds of that coin type. Returns error if
+// the account is invalid or database access fails.
+//
+// Example:
+//
+//	varBalance, err := wallet.AccountBalanceByCoinType(ctx, 0, cointype.CoinTypeVAR, 1)
+//	skaBalance, err := wallet.AccountBalanceByCoinType(ctx, 0, cointype.CoinType(1), 6)
+func (w *Wallet) AccountBalanceByCoinType(ctx context.Context, account uint32, coinType cointype.CoinType, confirms int32) (CoinBalance, error) {
+	const op errors.Op = "wallet.AccountBalanceByCoinType"
+
+	// Use the efficient direct method that only processes the specified coin type
+	var balance CoinBalance
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		var err error
+		balance, err = w.txStore.AccountBalanceByCoinType(dbtx, confirms, account, coinType)
+		return err
+	})
+	if err != nil {
+		return CoinBalance{}, errors.E(op, err)
+	}
+	return balance, nil
+}
+
+// AccountBalancesByCoinType returns balance breakdowns for all accounts
+// filtered by specific coin type.
+func (w *Wallet) AccountBalancesByCoinType(ctx context.Context, coinType cointype.CoinType, confirms int32) ([]CoinBalance, error) {
+	const op errors.Op = "wallet.AccountBalancesByCoinType"
+
+	var coinBalances []CoinBalance
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
+
+		// Get all accounts and fetch balance for each
+		return w.manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
+			balance, err := w.txStore.AccountBalanceByCoinType(dbtx, confirms, acct, coinType)
+			if err != nil {
+				return err
+			}
+			coinBalances = append(coinBalances, balance)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+	return coinBalances, nil
+}
+
+// TotalBalanceByCoinType returns the aggregated balance across all accounts for a specific coin type.
+// This method sums up all balances of the specified coin type from every account in the wallet,
+// providing a comprehensive view of total holdings for VAR or any SKA variant.
+//
+// Parameters:
+//   - coinType: The specific coin type to aggregate (0=VAR, 1-255=SKA variants)
+//   - confirms: Minimum confirmations required for inclusion in balance calculation
+//
+// Returns CoinBalance with aggregated totals across all accounts for the specified coin type.
+// All balance fields (Spendable, ImmatureReward, LockedByTickets, etc.) are summed across accounts.
+// Returns error if database access fails.
+//
+// Example:
+//
+//	totalVAR, err := wallet.TotalBalanceByCoinType(ctx, cointype.CoinTypeVAR, 1)
+//	totalSKA1, err := wallet.TotalBalanceByCoinType(ctx, cointype.CoinType(1), 6)
+func (w *Wallet) TotalBalanceByCoinType(ctx context.Context, coinType cointype.CoinType, confirms int32) (CoinBalance, error) {
+	const op errors.Op = "wallet.TotalBalanceByCoinType"
+
+	// Use the efficient method that directly queries each account for the specific coin type
+	var total CoinBalance
+	total.CoinType = coinType
+
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
+
+		// Iterate through all accounts and sum up balances for the specific coin type
+		return w.manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
+			balance, err := w.txStore.AccountBalanceByCoinType(dbtx, confirms, acct, coinType)
+			if err != nil {
+				return err
+			}
+
+			// Sum up all balance fields
+			total.ImmatureCoinbaseRewards += balance.ImmatureCoinbaseRewards
+			total.ImmatureStakeGeneration += balance.ImmatureStakeGeneration
+			total.LockedByTickets += balance.LockedByTickets
+			total.Spendable += balance.Spendable
+			total.Total += balance.Total
+			total.VotingAuthority += balance.VotingAuthority
+			total.Unconfirmed += balance.Unconfirmed
+
+			return nil
+		})
+	})
+	if err != nil {
+		return CoinBalance{}, errors.E(op, err)
+	}
+
+	return total, nil
+}
+
+// ListCoinTypes returns a sorted list of all coin types that have non-zero balances across all accounts.
+// This discovery method helps identify which coin types (VAR and/or SKA variants) are currently
+// held in the wallet, useful for UI display and transaction planning.
+//
+// Parameters:
+//   - confirms: Minimum confirmations required for inclusion in balance calculation
+//
+// Returns a slice of cointype.CoinType values sorted in ascending order (VAR=0 first, then SKA 1-255).
+// Only includes coin types with positive total balances across all accounts. Returns error if
+// database access fails.
+//
+// Example:
+//
+//	activeCoins, err := wallet.ListCoinTypes(ctx, 1)
+//	// Result might be: [0, 1, 5] representing VAR, SKA-1, and SKA-5
+func (w *Wallet) ListCoinTypes(ctx context.Context, confirms int32) ([]cointype.CoinType, error) {
+	const op errors.Op = "wallet.ListCoinTypes"
+
+	var coinTypes []cointype.CoinType
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		ns := dbtx.ReadBucket(wtxmgrNamespaceKey)
+
+		// Check VAR bucket first (always present)
+		varBucket := ns.NestedReadBucket([]byte("u:0")) // bucketUnspentForCoinType(cointype.CoinTypeVAR)
+		if varBucket != nil && varBucket.KeyN() > 0 {
+			coinTypes = append(coinTypes, cointype.CoinTypeVAR)
+		}
+
+		// Check only active SKA coin types from chain params
+		if w.chainParams != nil && w.chainParams.SKACoins != nil {
+			for coinType, config := range w.chainParams.SKACoins {
+				if !config.Active {
+					continue
+				}
+
+				// Check if this coin type has any unspent outputs or unmined credits
+				bucketName := fmt.Sprintf("u:%d", coinType)
+				bucket := ns.NestedReadBucket([]byte(bucketName))
+				if bucket != nil && bucket.KeyN() > 0 {
+					coinTypes = append(coinTypes, coinType)
+					continue
+				}
+
+				// Also check unmined credits
+				unminedBucketName := fmt.Sprintf("mc:%d", coinType)
+				unminedBucket := ns.NestedReadBucket([]byte(unminedBucketName))
+				if unminedBucket != nil && unminedBucket.KeyN() > 0 {
+					coinTypes = append(coinTypes, coinType)
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Sort coin types in ascending order
+	sort.Slice(coinTypes, func(i, j int) bool {
+		return coinTypes[i] < coinTypes[j]
+	})
+
+	return coinTypes, nil
+}
+
 // CurrentAddress gets the most recently requested payment address from a wallet.
 // If the address has already been used (there is at least one transaction
 // spending to it in the blockchain or dcrd mempool), the next chained address
@@ -1973,6 +2538,60 @@ func (w *Wallet) CurrentAddress(account uint32) (stdaddr.Address, error) {
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
+	return addr, nil
+}
+
+// CurrentAddressAndPersist gets the most recently requested payment address
+// from a wallet and persists it to the database. This ensures the address
+// appears in getaddressesbyaccount and can receive funds.
+// If the address has already been used (there is at least one transaction
+// spending to it in the blockchain or dcrd mempool), the next chained address
+// is returned.
+func (w *Wallet) CurrentAddressAndPersist(ctx context.Context, account uint32) (stdaddr.Address, error) {
+	const op errors.Op = "wallet.CurrentAddressAndPersist"
+
+	// Get the child index and derive the address while holding the lock
+	w.addressBuffersMu.Lock()
+	data, ok := w.addressBuffers[account]
+	if !ok {
+		w.addressBuffersMu.Unlock()
+		return nil, errors.E(op, errors.NotExist, errors.Errorf("no account %d", account))
+	}
+	buf := &data.albExternal
+	childIndex := buf.lastUsed + 1 + buf.cursor
+
+	// Derive the address
+	child, err := buf.branchXpub.Child(childIndex)
+	if err != nil {
+		w.addressBuffersMu.Unlock()
+		return nil, errors.E(op, err)
+	}
+	addr, err := compat.HD2Address(child, w.chainParams)
+	if err != nil {
+		w.addressBuffersMu.Unlock()
+		return nil, errors.E(op, err)
+	}
+
+	// Persist the address to the database
+	err = walletdb.Update(ctx, w.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		// Sync the address to the database
+		err := w.manager.SyncAccountToAddrIndex(ns, account, childIndex, udb.ExternalBranch)
+		if err != nil {
+			return err
+		}
+		// Mark it as returned
+		return w.manager.MarkReturnedChildIndex(tx, account, udb.ExternalBranch, childIndex)
+	})
+	if err != nil {
+		w.addressBuffersMu.Unlock()
+		return nil, errors.E(op, err)
+	}
+
+	// Increment cursor to mark this address as returned
+	buf.cursor++
+	w.addressBuffersMu.Unlock()
+
 	return addr, nil
 }
 
@@ -2012,8 +2631,8 @@ func (w *Wallet) SignHashes(ctx context.Context, hashes [][]byte, addr stdaddr.A
 func (w *Wallet) SignMessage(ctx context.Context, msg string, addr stdaddr.Address) (sig []byte, err error) {
 	const op errors.Op = "wallet.SignMessage"
 	var buf bytes.Buffer
-	wire.WriteVarString(&buf, 0, "Decred Signed Message:\n")
-	wire.WriteVarString(&buf, 0, msg)
+	_ = wire.WriteVarString(&buf, 0, "Decred Signed Message:\n")
+	_ = wire.WriteVarString(&buf, 0, msg)
 	messageHash := chainhash.HashB(buf.Bytes())
 	var privKey *secp256k1.PrivateKey
 	var done func()
@@ -2042,8 +2661,8 @@ func VerifyMessage(msg string, addr stdaddr.Address, sig []byte, params stdaddr.
 	// Validate the signature - this just shows that it was valid for any pubkey
 	// at all. Whether the pubkey matches is checked below.
 	var buf bytes.Buffer
-	wire.WriteVarString(&buf, 0, "Decred Signed Message:\n")
-	wire.WriteVarString(&buf, 0, msg)
+	_ = wire.WriteVarString(&buf, 0, "Decred Signed Message:\n")
+	_ = wire.WriteVarString(&buf, 0, msg)
 	expectedMessageHash := chainhash.HashB(buf.Bytes())
 	pk, wasCompressed, err := ecdsa.RecoverCompact(sig, expectedMessageHash)
 	if err != nil {
@@ -2425,6 +3044,8 @@ func listTransactions(tx walletdb.ReadTx, details *udb.TxDetails, addrMgr *udb.M
 		txTypeStr = types.LTTTVote
 	case stake.TxTypeSSRtx:
 		txTypeStr = types.LTTTRevocation
+	case stake.TxTypeSSFee:
+		txTypeStr = types.LTTTRegular // Intentionally mapped to Regular for RPC compatibility
 	}
 
 	// Fee can only be determined if every input is a debit.
@@ -3151,7 +3772,7 @@ func (w *Wallet) GetTicketsPrecise(ctx context.Context, rpc *dcrd.RPC,
 			if err != nil {
 				return false, err
 			}
-			header.FromBytes(headerBytes)
+			_ = header.FromBytes(headerBytes)
 			return f(tickets, header)
 		}
 
@@ -3225,7 +3846,7 @@ func (w *Wallet) GetTickets(ctx context.Context,
 			if err != nil {
 				return false, err
 			}
-			header.FromBytes(headerBytes)
+			_ = header.FromBytes(headerBytes)
 			return f(tickets, header)
 		}
 
@@ -3369,6 +3990,24 @@ type AccountsResult struct {
 	CurrentBlockHeight int32
 }
 
+// getActiveCoinTypes returns a slice containing VAR (coin type 0) plus all
+// active SKA coin types configured in the chain parameters. This replaces
+// inefficient loops that iterate through all 256 possible coin types.
+func (w *Wallet) getActiveCoinTypes() []cointype.CoinType {
+	activeCoinTypes := []cointype.CoinType{cointype.CoinType(0)} // Always include VAR
+
+	// Add active SKA coin types from chain parameters
+	if w.chainParams != nil && w.chainParams.SKACoins != nil {
+		for coinType, config := range w.chainParams.SKACoins {
+			if config != nil {
+				activeCoinTypes = append(activeCoinTypes, coinType)
+			}
+		}
+	}
+
+	return activeCoinTypes
+}
+
 // Accounts returns the current names, numbers, and total balances of all
 // accounts in the wallet.  The current chain tip is included in the result for
 // atomicity reasons.
@@ -3390,11 +4029,16 @@ func (w *Wallet) Accounts(ctx context.Context) (*AccountsResult, error) {
 		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
 
 		tipHash, tipHeight = w.txStore.MainChainTip(dbtx)
-		unspent, err := w.txStore.UnspentOutputs(dbtx)
-		if err != nil {
-			return err
+		// Get unspent outputs for active coin types only
+		var unspent []*udb.Credit
+		for _, ct := range w.getActiveCoinTypes() {
+			outputs, err := w.txStore.UnspentOutputs(dbtx, ct)
+			if err != nil {
+				return err
+			}
+			unspent = append(unspent, outputs...)
 		}
-		err = w.manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
+		err := w.manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
 			props, err := w.manager.AccountProperties(addrmgrNs, acct)
 			if err != nil {
 				return err
@@ -3491,9 +4135,14 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 		_, tipHeight := w.txStore.MainChainTip(dbtx)
 
 		filter := len(addresses) != 0
-		unspent, err := w.txStore.UnspentOutputs(dbtx)
-		if err != nil {
-			return err
+		// Get unspent outputs for active coin types only
+		var unspent []*udb.Credit
+		for _, ct := range w.getActiveCoinTypes() {
+			outputs, err := w.txStore.UnspentOutputs(dbtx, ct)
+			if err != nil {
+				return err
+			}
+			unspent = append(unspent, outputs...)
 		}
 		sort.Sort(sort.Reverse(creditSlice(unspent)))
 
@@ -3547,6 +4196,12 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 				}
 			case stake.TxTypeSSRtx:
 				// All outputs for SSRtx tx are only spendable
+				// after coinbase maturity many blocks.
+				if !coinbaseMatured(w.chainParams, details.Height(), tipHeight) {
+					continue
+				}
+			case stake.TxTypeSSFee:
+				// All spendable outputs (non-OP_RETURN) for SSFee tx are only spendable
 				// after coinbase maturity many blocks.
 				if !coinbaseMatured(w.chainParams, details.Height(), tipHeight) {
 					continue
@@ -3654,6 +4309,7 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 				Amount:        output.Amount.ToCoin(),
 				Confirmations: int64(confs),
 				Spendable:     spendable,
+				CoinType:      uint8(output.CoinType), // Dual-coin support: include coin type
 			}
 
 			// BUG: this should be a JSON array so that all
@@ -4525,20 +5181,24 @@ func (w *Wallet) TotalReceivedForAccounts(ctx context.Context, minConf int32) ([
 
 // TotalReceivedForAddr iterates through a wallet's transaction history,
 // returning the total amount of decred received for a single wallet
-// address.
-func (w *Wallet) TotalReceivedForAddr(ctx context.Context, addr stdaddr.Address, minConf int32) (dcrutil.Amount, error) {
+// address, optionally filtered by coin type (defaults to VAR/0).
+func (w *Wallet) TotalReceivedForAddr(ctx context.Context, addr stdaddr.Address, minConf int32, coinType ...cointype.CoinType) (dcrutil.Amount, error) {
 	const op errors.Op = "wallet.TotalReceivedForAddr"
+
+	// Default to VAR (coin type 0) if no coin type specified
+	filterCoinType := cointype.CoinTypeVAR
+	if len(coinType) > 0 {
+		filterCoinType = coinType[0]
+	}
+
 	var amount dcrutil.Amount
 	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
 		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-
 		_, tipHeight := w.txStore.MainChainTip(dbtx)
-
 		var (
 			addrStr    = addr.String()
 			stopHeight int32
 		)
-
 		if minConf > 0 {
 			stopHeight = tipHeight - minConf + 1
 		} else {
@@ -4548,8 +5208,13 @@ func (w *Wallet) TotalReceivedForAddr(ctx context.Context, addr stdaddr.Address,
 			for i := range details {
 				detail := &details[i]
 				for _, cred := range detail.Credits {
-					pkVersion := detail.MsgTx.TxOut[cred.Index].Version
-					pkScript := detail.MsgTx.TxOut[cred.Index].PkScript
+					txOut := detail.MsgTx.TxOut[cred.Index]
+					// Check if this output matches the requested coin type
+					if txOut.CoinType != filterCoinType {
+						continue
+					}
+					pkVersion := txOut.Version
+					pkScript := txOut.PkScript
 					_, addrs := stdscript.ExtractAddrs(pkVersion, pkScript, w.chainParams)
 					for _, a := range addrs { // no addresses means non-standard credit, ignored
 						if addrStr == a.String() {
@@ -4573,9 +5238,16 @@ func (w *Wallet) TotalReceivedForAddr(ctx context.Context, addr stdaddr.Address,
 // transaction hash upon success
 func (w *Wallet) SendOutputs(ctx context.Context, outputs []*wire.TxOut, account, changeAccount uint32, minconf int32) (*chainhash.Hash, error) {
 	const op errors.Op = "wallet.SendOutputs"
-	relayFee := w.RelayFee()
+
+	// Determine the coin type from outputs for coin-type-aware fee calculation
+	coinType := txrules.GetCoinTypeFromOutputs(outputs)
+
+	// Calculate appropriate fee rate based on coin type using user-configured fees
+	txFeeRate := w.RelayFeeForCoinType(ctx, coinType)
+
+	// Validate outputs with appropriate fee rate
 	for _, output := range outputs {
-		err := txrules.CheckOutput(output, relayFee)
+		err := txrules.CheckOutput(output, txFeeRate)
 		if err != nil {
 			return nil, errors.E(op, err)
 		}
@@ -4587,7 +5259,7 @@ func (w *Wallet) SendOutputs(ctx context.Context, outputs []*wire.TxOut, account
 		changeAccount:      changeAccount,
 		minconf:            minconf,
 		randomizeChangeIdx: true,
-		txFee:              relayFee,
+		txFee:              txFeeRate,
 		dontSignTx:         false,
 		isTreasury:         false,
 	}
@@ -4673,7 +5345,8 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 	// outputs would already be reserved.
 	if len(tx.TxIn) == 0 {
 		const minconf = 1
-		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, fee, minconf)
+		// VSP fees are paid in VAR (staking is VAR-only)
+		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, fee, minconf, cointype.CoinTypeVAR)
 		if err != nil {
 			return fmt.Errorf("unable to reserve outputs: %w", err)
 		}
@@ -5520,6 +6193,30 @@ func Open(ctx context.Context, cfg *Config) (*Wallet, error) {
 
 	// Amounts
 	w.relayFee = cfg.RelayFee
+	// Initialize SKA relay fee from chain parameters
+	if w.chainParams.SKAMinRelayTxFee > 0 {
+		w.skaRelayFee = dcrutil.Amount(w.chainParams.SKAMinRelayTxFee)
+	} else {
+		w.skaRelayFee = cfg.RelayFee // Fallback to VAR fee if no SKA fee configured
+	}
+
+	// Initialize per-cointype fee maps
+	w.manualFees = make(map[cointype.CoinType]*dcrutil.Amount)
+	w.staticFees = make(map[cointype.CoinType]dcrutil.Amount)
+
+	// Set static fallback fee for VAR (coin type 0)
+	w.staticFees[cointype.CoinTypeVAR] = cfg.RelayFee
+
+	// Set static fallback fees for each active SKA coin from chain params
+	for ct, config := range w.chainParams.SKACoins {
+		if config != nil && config.Active {
+			if w.chainParams.SKAMinRelayTxFee > 0 {
+				w.staticFees[ct] = dcrutil.Amount(w.chainParams.SKAMinRelayTxFee)
+			} else {
+				w.staticFees[ct] = cfg.RelayFee // fallback to VAR fee
+			}
+		}
+	}
 
 	// Record current tip as initialHeight.
 	_, w.initialHeight = w.MainChainTip(ctx)
@@ -5821,4 +6518,34 @@ func (w *Wallet) ProcessedTickets(ctx context.Context) ([]*VSPTicket, error) {
 	}
 
 	return managedTickets, nil
+}
+
+// StoreEmissionKey stores an emission private key in the wallet database.
+// This is a public method that can be called from RPC handlers.
+func (w *Wallet) StoreEmissionKey(ctx context.Context, keyName string, privateKey *secp256k1.PrivateKey) error {
+	const op errors.Op = "wallet.StoreEmissionKey"
+	return walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		ns := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errors.E(op, errors.Invalid, "address manager namespace not found")
+		}
+		return w.manager.StoreEmissionKey(ns, keyName, privateKey)
+	})
+}
+
+// RetrieveEmissionKey retrieves an emission private key from the wallet database.
+// This is a public method that can be called from RPC handlers.
+func (w *Wallet) RetrieveEmissionKey(ctx context.Context, keyName string) (*secp256k1.PrivateKey, error) {
+	const op errors.Op = "wallet.RetrieveEmissionKey"
+	var privateKey *secp256k1.PrivateKey
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		ns := dbtx.ReadBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errors.E(op, errors.Invalid, "address manager namespace not found")
+		}
+		var err error
+		privateKey, err = w.manager.RetrieveEmissionKey(ns, keyName)
+		return err
+	})
+	return privateKey, err
 }

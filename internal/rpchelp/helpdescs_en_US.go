@@ -56,6 +56,7 @@ var helpDescsEnUS = map[string]string{
 	"consolidate-inputs":    "Number of UTXOs to consolidate as inputs",
 	"consolidate-account":   "Optional: Account from which unspent outputs are picked. When no address specified, also the account used to obtain an output address.",
 	"consolidate-address":   "Optional: Address to pay.  Default is obtained via getnewaddress from the account's address pool.",
+	"consolidate-cointype":  "Optional: Coin type to consolidate (0=VAR, 1-255=SKA). Default is VAR (0).",
 	"consolidate--result0":  "Transaction hash for the consolidation transaction",
 
 	// CreateMultisigCmd help.
@@ -75,6 +76,14 @@ var helpDescsEnUS = map[string]string{
 	"createnewaccount--synopsis": "Creates a new account.\n" +
 		"The wallet must be unlocked for this request to succeed.",
 	"createnewaccount-account": "Name of the new account",
+
+	// CreateAuthorizedEmissionCmd help.
+	"createauthorizedemission--synopsis": "Creates a cryptographically authorized SKA emission transaction using governance-defined parameters.\n" +
+		"The wallet must be unlocked for this request to succeed.",
+	"createauthorizedemission-cointype":        "SKA coin type to emit (1-255)",
+	"createauthorizedemission-emissionkeyname": "Name of the imported emission private key",
+	"createauthorizedemission-passphrase":      "Wallet passphrase for key access",
+	"createauthorizedemission--result0":        "Hex-encoded bytes of the signed emission transaction",
 
 	// CreateRawTransactionCmd help.
 	"createrawtransaction--synopsis": "Returns a new transaction spending the provided inputs and sending to the provided addresses.\n" +
@@ -136,6 +145,14 @@ var helpDescsEnUS = map[string]string{
 	"fundrawtransactionresult-hex":            "Funded transaction in hex encoding",
 	"fundrawtransactionresult-fee":            "Absolute fee of funded transaction",
 
+	// GenerateEmissionKeyCmd help.
+	"generateemissionkey--synopsis": "Generates a new private key for SKA emission authorization.\n" +
+		"The wallet must be unlocked for this request to succeed.",
+	"generateemissionkey-keyname":    "Unique identifier for this emission key",
+	"generateemissionkey-passphrase": "Wallet passphrase for key generation",
+	"generateemissionkey-cointype":   "Optional SKA coin type (1-255) for organization",
+	"generateemissionkey--result0":   "The public key corresponding to the generated private key",
+
 	// GetAccountAddressCmd help.
 	"getaccountaddress--synopsis": "DEPRECATED -- Returns the most recent external payment address for an account that has not been seen publicly.\n" +
 		"A new address is generated for the account if the most recently generated address has been seen on the blockchain or in mempool.",
@@ -156,6 +173,7 @@ var helpDescsEnUS = map[string]string{
 	"getbalance--synopsis": "Calculates and returns the balance of all accounts.",
 	"getbalance-minconf":   "Minimum number of block confirmations required before an unspent output's value is included in the balance",
 	"getbalance-account":   "The account name to query the balance for, or \"*\" to consider all accounts (default=\"*\")",
+	"getbalance-cointype":  "Optional coin type to filter by (0=VAR, 1-255=SKA)",
 
 	"getbalanceresult-balances":                       "Balances for all accounts.",
 	"getaccountbalanceresult-accountname":             "Name of account.",
@@ -174,6 +192,35 @@ var helpDescsEnUS = map[string]string{
 	"getbalanceresult-cumulativetotal":                "Total number of coins.",
 	"getbalanceresult-totalunconfirmed":               "Total number of unconfirmed coins.",
 	"getbalanceresult-totalvotingauthority":           "Total number of coins for voting authority.",
+
+	// GetCoinBalanceCmd help.
+	"getcoinbalance--synopsis": "Returns the balance for a specific coin type (VAR or SKA) with detailed breakdown.",
+	"getcoinbalance-cointype":  "Coin type to query balance for (0=VAR, 1-255=SKA)",
+	"getcoinbalance-account":   "Account name to query balance for, or \"*\" for all accounts (default=\"*\")",
+	"getcoinbalance-minconf":   "Minimum number of block confirmations required before an unspent output's value is included in the balance",
+
+	// GetCoinBalanceResult help.
+	"getcoinbalanceresult-cointype":                     "The coin type for which the balance is reported",
+	"getcoinbalanceresult-blockhash":                    "Block hash of the tip block",
+	"getcoinbalanceresult-totalimmaturecoinbaserewards": "Total immature coinbase reward coins",
+	"getcoinbalanceresult-totalimmaturestakegeneration": "Total immature stake generation coins",
+	"getcoinbalanceresult-totallockedbytickets":         "Total coins locked by tickets",
+	"getcoinbalanceresult-totalspendable":               "Total spendable balance for the coin type",
+	"getcoinbalanceresult-totalunconfirmed":             "Total unconfirmed balance",
+	"getcoinbalanceresult-totalvotingauthority":         "Total coins for voting authority",
+	"getcoinbalanceresult-cumulativetotal":              "Total balance including immature and locked coins",
+	"getcoinbalanceresult-balances":                     "Per-account balance breakdown",
+
+	// GetCoinAccountBalanceResult help.
+	"getcoinaccountbalanceresult-accountname":             "Name of the account",
+	"getcoinaccountbalanceresult-cointype":                "Coin type for this account balance (0=VAR, 1-255=SKA)",
+	"getcoinaccountbalanceresult-immaturecoinbaserewards": "Immature coinbase reward coins",
+	"getcoinaccountbalanceresult-immaturestakegeneration": "Immature stake generation coins",
+	"getcoinaccountbalanceresult-lockedbytickets":         "Coins locked by tickets",
+	"getcoinaccountbalanceresult-spendable":               "Spendable balance for this account and coin type",
+	"getcoinaccountbalanceresult-total":                   "Total balance for this account and coin type",
+	"getcoinaccountbalanceresult-unconfirmed":             "Unconfirmed balance",
+	"getcoinaccountbalanceresult-votingauthority":         "Coins for voting authority",
 
 	// GetBalanceToMaintainCmd help.
 	"getbalancetomaintain--synopsis": "Get the current balance to maintain",
@@ -331,6 +378,11 @@ var helpDescsEnUS = map[string]string{
 	"getcfilterv2result-filter":    "Hex-encoded bytes of the serialized filter",
 	"getcfilterv2result-key":       "The key required to query the filter for matches against committed scripts",
 
+	// ClearVoteFeeConsolidationAddressCmd help.
+	"clearvotefeeconsolidationaddress--synopsis": "Clear the custom consolidation address for vote fee (SSFee) payments, reverting to the default first external address (index 0).",
+	"clearvotefeeconsolidationaddress-account":   "The account name or number",
+	"clearvotefeeconsolidationaddress--result0":  "Success message confirming the consolidation address was cleared",
+
 	// SyncStatusCmd help.
 	"syncstatus--synopsis": "Returns information about this wallet's synchronization to the network.",
 
@@ -403,6 +455,7 @@ var helpDescsEnUS = map[string]string{
 	"getreceivedbyaddress--synopsis": "Returns the total amount received by a single address, including spent outputs.",
 	"getreceivedbyaddress-address":   "Payment address which received outputs to include in total",
 	"getreceivedbyaddress-minconf":   "Minimum number of block confirmations required before an output's value is included in the total",
+	"getreceivedbyaddress-cointype":  "Coin type to filter results (0=VAR, 1-255=SKA coin types)",
 	"getreceivedbyaddress--result0":  "The total received amount valued in decred",
 
 	// GetStakeInfo help.
@@ -480,8 +533,20 @@ var helpDescsEnUS = map[string]string{
 	"getvotechoicesresult-version": "The latest stake version supported by the software and the version of the included agendas",
 	"getvotechoicesresult-choices": "The currently configured agenda vote choices, including abstaining votes",
 
+	// GetVoteFeeConsolidationAddressCmd help.
+	"getvotefeeconsolidationaddress--synopsis": "Get the consolidation address for vote fee (SSFee) payments for a specific account.\n" +
+		"Returns the custom address if set, or the default first external address (index 0) otherwise.",
+	"getvotefeeconsolidationaddress-account":  "The account name or number",
+	"getvotefeeconsolidationaddress--result0": "JSON object with consolidation address details",
+
+	// GetVoteFeeConsolidationAddressResult help.
+	"getvotefeeconsolidationaddressresult-account":   "The account name",
+	"getvotefeeconsolidationaddressresult-address":   "The consolidation address",
+	"getvotefeeconsolidationaddressresult-isdefault": "True if using the default address (first external), false if custom address is set",
+
 	// GetWalletFeeCmd help.
 	"getwalletfee--synopsis": "Get currently set transaction fee for the wallet",
+	"getwalletfee-cointype":  "Coin type to get fee for (0=VAR, 1-255=SKA coin types)",
 	"getwalletfee--result0":  "Current tx fee (in DCR)",
 
 	// HelpCmd help.
@@ -510,6 +575,15 @@ var helpDescsEnUS = map[string]string{
 	"importcfiltersv2--synopsis":   "Imports a list of v2 cfilters into the wallet. Does not perform validation on the filters",
 	"importcfiltersv2-startheight": "The starting block height for this list of cfilters",
 	"importcfiltersv2-filters":     "The list of hex-encoded cfilters",
+
+	// ImportEmissionKeyCmd help.
+	"importemissionkey--synopsis": "Imports a private key for SKA emission authorization (emergency/recovery only).\n" +
+		"The wallet must be unlocked for this request to succeed.",
+	"importemissionkey-keyname":    "Unique identifier for this emission key",
+	"importemissionkey-privatekey": "Hex-encoded secp256k1 private key or encrypted format",
+	"importemissionkey-passphrase": "Wallet passphrase for key encryption",
+	"importemissionkey-cointype":   "Optional SKA coin type (1-255) for organization",
+	"importemissionkey--result0":   "The public key corresponding to the imported private key",
 
 	// ImportPrivKeyCmd help.
 	"importprivkey--synopsis": "Imports a WIF-encoded private key to the 'imported' account.",
@@ -647,6 +721,7 @@ var helpDescsEnUS = map[string]string{
 	"listunspent-maxconf":   "Maximum number of block confirmations required before a transaction output is excluded",
 	"listunspent-addresses": "If set, limits the returned details to unspent outputs received by any of these payment addresses",
 	"listunspent-account":   "If set, only return unspent outputs from this account",
+	"listunspent-cointype":  "Optional coin type to filter by (0=VAR, 1-255=SKA)",
 
 	// ListUnspentResult help.
 	"listunspentresult-txid":          "The transaction hash of the referenced output",
@@ -660,6 +735,19 @@ var helpDescsEnUS = map[string]string{
 	"listunspentresult-spendable":     "Whether the output is entirely controlled by wallet keys/scripts (false for partially controlled multisig outputs or outputs to watch-only addresses)",
 	"listunspentresult-txtype":        "The type of the transaction",
 	"listunspentresult-tree":          "The tree the transaction comes from",
+	"listunspentresult-cointype":      "The coin type of the unspent output (0=VAR, 1-255=SKA)",
+
+	// ListCoinTypesCmd help.
+	"listcointypes--synopsis": "Returns a JSON array of objects representing coin types with non-zero balances in the wallet.",
+	"listcointypes-minconf":   "Minimum number of block confirmations required before a transaction output is considered for balance calculation",
+
+	// ListCoinTypesResult help.
+	"listcointypesresult-cointypes": "Array of coin type information objects",
+
+	// CoinTypeInfo help.
+	"cointypeinfo-cointype": "The coin type number (0=VAR, 1-255=SKA)",
+	"cointypeinfo-name":     "Human-readable name of the coin type",
+	"cointypeinfo-balance":  "Total balance for this coin type",
 
 	// LockAccountCmd help.
 	"lockaccount--synopsis": "Lock an individually-encrypted account",
@@ -733,6 +821,7 @@ var helpDescsEnUS = map[string]string{
 	"sendfrom-minconf":     "Minimum number of block confirmations required before a transaction output is eligible to be spent",
 	"sendfrom-comment":     "Unused",
 	"sendfrom-commentto":   "Unused",
+	"sendfrom-cointype":    "Optional coin type to send (0=VAR, 1-255=SKA)",
 	"sendfrom--result0":    "The transaction hash of the sent transaction",
 
 	// SendFromTreasuryCmd help.
@@ -754,6 +843,7 @@ var helpDescsEnUS = map[string]string{
 	"sendmany-amounts--value": "Amount to send to the payment address valued in decred",
 	"sendmany-minconf":        "Minimum number of block confirmations required before a transaction output is eligible to be spent",
 	"sendmany-comment":        "Unused",
+	"sendmany-cointype":       "Optional coin type to send (0=VAR, 1-255=SKA)",
 	"sendmany--result0":       "The transaction hash of the sent transaction",
 
 	// SendRawTransactionCmd help.
@@ -770,6 +860,7 @@ var helpDescsEnUS = map[string]string{
 	"sendtoaddress-amount":    "Amount to send to the payment address valued in decred",
 	"sendtoaddress-comment":   "Unused",
 	"sendtoaddress-commentto": "Unused",
+	"sendtoaddress-cointype":  "Optional coin type to send (0=VAR, 1-255=SKA)",
 	"sendtoaddress--result0":  "The transaction hash of the sent transaction",
 
 	// SendToMultisigCmd help.
@@ -788,6 +879,17 @@ var helpDescsEnUS = map[string]string{
 	"sendtotreasury--synopsis": "Send decred to treasury",
 	"sendtotreasury-amount":    "Amount to send to treasury",
 	"sendtotreasury--result0":  "The transaction hash of the sent transaction",
+
+	// SendToBurnCmd help.
+	"sendtoburn--synopsis": "⚠️  WARNING: IRREVERSIBLE OPERATION ⚠️\n" +
+		"Permanently burns (destroys) SKA coins making them unspendable forever.\n" +
+		"This action cannot be undone. Burned coins are permanently removed from circulation.\n" +
+		"Only SKA coin types (1-255) can be burned.",
+	"sendtoburn-amount":     "Amount of SKA coins to burn (in coin units, e.g., 100.5)",
+	"sendtoburn-cointype":   "SKA coin type to burn (must be 1-255, VAR cannot be burned)",
+	"sendtoburn-comment":    "Optional comment for user records (not stored on blockchain)",
+	"sendtoburn-passphrase": "Wallet passphrase required for authorization",
+	"sendtoburn--result0":   "The transaction hash of the burn transaction",
 
 	// SetAccountPassphraseCmd help.
 	"setaccountpassphrase--synopsis": "Individually encrypt or change per-account passphrase",
@@ -834,6 +936,7 @@ var helpDescsEnUS = map[string]string{
 	// SetTxFeeCmd help.
 	"settxfee--synopsis": "Modify the fee per kB of the serialized tx size used each time more fee is required for an authored transaction.",
 	"settxfee-amount":    "The new fee per kB of the serialized tx size valued in decred",
+	"settxfee-cointype":  "Coin type to set fee for (0=VAR, 1-255=SKA coin types)",
 	"settxfee--result0":  "The boolean 'true'",
 
 	// SetVoteChoice help.
@@ -841,6 +944,13 @@ var helpDescsEnUS = map[string]string{
 	"setvotechoice-agendaid":   "The ID for the agenda to modify",
 	"setvotechoice-choiceid":   "The ID for the choice to choose",
 	"setvotechoice-tickethash": "The hash of the ticket to set choices for",
+
+	// SetVoteFeeConsolidationAddressCmd help.
+	"setvotefeeconsolidationaddress--synopsis": "Set a custom consolidation address for vote fee (SSFee) payments for a specific account.\n" +
+		"This overrides the default first external address (index 0).",
+	"setvotefeeconsolidationaddress-account":  "The account name or number",
+	"setvotefeeconsolidationaddress-address":  "The consolidation address to use for SSFee payments",
+	"setvotefeeconsolidationaddress--result0": "Success message confirming the consolidation address was set",
 
 	// SignMessageCmd help.
 	"signmessage--synopsis": "Signs a message using the private key of a payment address.",

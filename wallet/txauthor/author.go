@@ -11,6 +11,7 @@ import (
 	"decred.org/dcrwallet/v5/wallet/txrules"
 	"decred.org/dcrwallet/v5/wallet/txsizes"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/crypto/rand"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4"
@@ -100,7 +101,20 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 	}
 	changeScriptSize := fetchChange.ScriptSize()
 	maxSignedSize := txsizes.EstimateSerializeSize(scriptSizes, outputs, changeScriptSize)
+
+	// Calculate initial fee for transaction size estimation
+	// SKA emission transactions have zero fees, all other transactions use normal fees
 	targetFee := txrules.FeeForSerializeSize(relayFeePerKb, maxSignedSize)
+
+	// Check if this is an SKA emission transaction (need to create temp tx to check)
+	tempTx := &wire.MsgTx{
+		SerType: wire.TxSerializeFull,
+		Version: generatedTxVersion,
+		TxOut:   outputs,
+	}
+	if wire.IsSKAEmissionTransaction(tempTx) {
+		targetFee = 0 // SKA emission transactions have zero fees
+	}
 
 	for {
 		inputDetail, err := fetchInputs(targetAmount + targetFee)
@@ -116,7 +130,20 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 		scriptSizes = append(scriptSizes, inputDetail.RedeemScriptSizes...)
 
 		maxSignedSize = txsizes.EstimateSerializeSize(scriptSizes, outputs, changeScriptSize)
+
+		// Calculate fee based on actual transaction size
+		// Check if this is an SKA emission transaction for final fee calculation
+		tempTxWithInputs := &wire.MsgTx{
+			SerType: wire.TxSerializeFull,
+			Version: generatedTxVersion,
+			TxIn:    inputDetail.Inputs,
+			TxOut:   outputs,
+		}
 		maxRequiredFee := txrules.FeeForSerializeSize(relayFeePerKb, maxSignedSize)
+		if wire.IsSKAEmissionTransaction(tempTxWithInputs) {
+			maxRequiredFee = 0 // SKA emission transactions have zero fees
+		}
+
 		remainingAmount := inputDetail.Amount - targetAmount
 		if remainingAmount < maxRequiredFee {
 			targetFee = maxRequiredFee
@@ -137,16 +164,28 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 		}
 		changeIndex := -1
 		changeAmount := inputDetail.Amount - targetAmount - maxRequiredFee
+
+		// For dust amount check, use the same fee rate as transaction
+		dustFeeRate := relayFeePerKb
+
 		if changeAmount != 0 && !txrules.IsDustAmount(changeAmount,
-			changeScriptSize, relayFeePerKb) {
+			changeScriptSize, dustFeeRate) {
 			if len(changeScript) > txscript.MaxScriptElementSize {
 				return nil, errors.E(errors.Invalid, "script size exceed maximum bytes "+
 					"pushable to the stack")
 			}
+
+			// Set the coin type for the change output to match the transaction
+			var changeCoinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR
+			if len(outputs) > 0 {
+				changeCoinType = outputs[0].CoinType
+			}
+
 			change := &wire.TxOut{
 				Value:    int64(changeAmount),
 				Version:  changeScriptVersion,
 				PkScript: changeScript,
+				CoinType: changeCoinType,
 			}
 			l := len(outputs)
 			unsignedTransaction.TxOut = append(outputs[:l:l], change)

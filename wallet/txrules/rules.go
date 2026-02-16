@@ -7,6 +7,8 @@ package txrules
 
 import (
 	"decred.org/dcrwallet/v5/errors"
+	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/txscript/v4/stdscript"
@@ -80,7 +82,7 @@ func CheckOutput(output *wire.TxOut, relayFeePerKb dcrutil.Amount) error {
 	if output.Value < 0 {
 		return errors.E(errors.Invalid, "transaction output amount is negative")
 	}
-	if output.Value > dcrutil.MaxAmount {
+	if dcrutil.Amount(output.Value) > dcrutil.Amount(cointype.MaxVARAmount) {
 		return errors.E(errors.Invalid, "transaction output amount exceeds maximum value")
 	}
 	if IsDustOutput(output, relayFeePerKb) {
@@ -98,8 +100,8 @@ func FeeForSerializeSize(relayFeePerKb dcrutil.Amount, txSerializeSize int) dcru
 		fee = relayFeePerKb
 	}
 
-	if fee < 0 || fee > dcrutil.MaxAmount {
-		fee = dcrutil.MaxAmount
+	if fee < 0 || fee > dcrutil.Amount(cointype.MaxVARAmount) {
+		fee = dcrutil.Amount(cointype.MaxVARAmount)
 	}
 
 	return fee
@@ -110,6 +112,70 @@ func sumOutputValues(outputs []*wire.TxOut) (totalOutput dcrutil.Amount) {
 		totalOutput += dcrutil.Amount(txOut.Value)
 	}
 	return totalOutput
+}
+
+// FeeForSerializeSizeDualCoin calculates the required fee for a transaction.
+// All coin types (VAR and SKA) pay fees in their own coin type.
+// The fee calculation is the same for all coin types.
+func FeeForSerializeSizeDualCoin(relayFeePerKb dcrutil.Amount, txSerializeSize int, coinType cointype.CoinType) dcrutil.Amount {
+	// All coin types use the same fee calculation
+	// The fee is paid in the same coin type as the transaction
+	return FeeForSerializeSize(relayFeePerKb, txSerializeSize)
+}
+
+// FeeForSerializeSizeWithChainParams calculates the required fee for a transaction
+// based on coin type using proper chain parameters for SKA fee rates.
+func FeeForSerializeSizeWithChainParams(relayFeePerKb dcrutil.Amount, txSerializeSize int, coinType cointype.CoinType, chainParams *chaincfg.Params) dcrutil.Amount {
+	switch coinType {
+	case cointype.CoinTypeVAR:
+		// VAR transactions use the provided relay fee rate
+		return FeeForSerializeSize(relayFeePerKb, txSerializeSize)
+
+	default:
+		// SKA and other coin types: use chain-specific fee rates
+		if chainParams != nil && chainParams.SKAMinRelayTxFee > 0 {
+			// Use SKA-specific fee rate from chain parameters
+			skaFeePerKb := dcrutil.Amount(chainParams.SKAMinRelayTxFee)
+			return FeeForSerializeSize(skaFeePerKb, txSerializeSize)
+		}
+		// Fallback to VAR fee rate if no SKA rate is configured
+		return FeeForSerializeSize(relayFeePerKb, txSerializeSize)
+	}
+}
+
+// GetCoinTypeFromOutputs determines the coin type of transaction outputs.
+// Since transactions cannot mix coin types (all outputs must have the same coin type),
+// this returns the coin type of the first output, or VAR if there are no outputs.
+func GetCoinTypeFromOutputs(outputs []*wire.TxOut) cointype.CoinType {
+	if len(outputs) == 0 {
+		return cointype.CoinTypeVAR
+	}
+	// All outputs in a transaction must have the same coin type,
+	// so we can simply return the coin type of the first output
+	return outputs[0].CoinType
+}
+
+// IsDustAmountDualCoin determines dust for the dual-coin system.
+// All coin types use the same dust calculation.
+func IsDustAmountDualCoin(amount dcrutil.Amount, scriptSize int, relayFeePerKb dcrutil.Amount, coinType cointype.CoinType) bool {
+	return IsDustAmount(amount, scriptSize, relayFeePerKb)
+}
+
+// IsDustOutputDualCoin determines whether a transaction output is considered dust
+// in the dual-coin system.
+func IsDustOutputDualCoin(output *wire.TxOut, relayFeePerKb dcrutil.Amount) bool {
+	// Unspendable outputs which solely carry data are not checked for dust.
+	if stdscript.IsNullDataScript(output.Version, output.PkScript) {
+		return false
+	}
+
+	// All other unspendable outputs are considered dust.
+	if txscript.IsUnspendable(output.Value, output.PkScript) {
+		return true
+	}
+
+	return IsDustAmountDualCoin(dcrutil.Amount(output.Value), len(output.PkScript),
+		relayFeePerKb, output.CoinType)
 }
 
 // PaysHighFees checks whether the signed transaction pays insanely high fees.

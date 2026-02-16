@@ -8,6 +8,10 @@ package jsonrpc
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -36,9 +40,11 @@ import (
 	blockchain "github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/crypto/rand"
 	"github.com/decred/dcrd/dcrec"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/dcrjson/v4"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/hdkeychain/v3"
@@ -49,6 +55,14 @@ import (
 	"github.com/decred/dcrd/txscript/v4/stdscript"
 	"github.com/decred/dcrd/wire"
 	"golang.org/x/sync/errgroup"
+)
+
+// Dual-coin constants
+const (
+	// CoinTypeVAR represents the VAR coin type (mined coins)
+	CoinTypeVAR = uint8(cointype.CoinTypeVAR)
+	// CoinTypeMaxSKA represents the maximum valid SKA coin type
+	CoinTypeMaxSKA = uint8(cointype.CoinTypeMax)
 )
 
 // API version constants
@@ -69,6 +83,14 @@ const (
 	scriptVersionAssumed = 0
 )
 
+// validateCoinType validates a coin type parameter and returns an appropriate error
+func validateCoinType(coinType cointype.CoinType) error {
+	if !coinType.IsValid() {
+		return rpcErrorf(dcrjson.ErrRPCInvalidParameter, "cointype must be between %d (VAR) and %d (SKA)", CoinTypeVAR, CoinTypeMaxSKA)
+	}
+	return nil
+}
+
 // confirms returns the number of confirmations for a transaction in a block at
 // height txHeight (or -1 for an unconfirmed tx) given the chain height
 // curHeight.
@@ -83,109 +105,118 @@ func confirms(txHeight, curHeight int32) int32 {
 
 // the registered rpc handlers
 var handlers = map[string]handler{
-	"abandontransaction":        {fn: (*Server).abandonTransaction},
-	"accountaddressindex":       {fn: (*Server).accountAddressIndex},
-	"accountsyncaddressindex":   {fn: (*Server).accountSyncAddressIndex},
-	"accountunlocked":           {fn: (*Server).accountUnlocked},
-	"addmultisigaddress":        {fn: (*Server).addMultiSigAddress},
-	"addtransaction":            {fn: (*Server).addTransaction},
-	"auditreuse":                {fn: (*Server).auditReuse},
-	"consolidate":               {fn: (*Server).consolidate},
-	"createmultisig":            {fn: (*Server).createMultiSig},
-	"createnewaccount":          {fn: (*Server).createNewAccount},
-	"createrawtransaction":      {fn: (*Server).createRawTransaction},
-	"createsignature":           {fn: (*Server).createSignature},
-	"debuglevel":                {fn: (*Server).debugLevel},
-	"disapprovepercent":         {fn: (*Server).disapprovePercent},
-	"discoverusage":             {fn: (*Server).discoverUsage},
-	"dumpprivkey":               {fn: (*Server).dumpPrivKey},
-	"fundrawtransaction":        {fn: (*Server).fundRawTransaction},
-	"getaccount":                {fn: (*Server).getAccount},
-	"getaccountaddress":         {fn: (*Server).getAccountAddress},
-	"getaddressesbyaccount":     {fn: (*Server).getAddressesByAccount},
-	"getbalance":                {fn: (*Server).getBalance},
-	"getbestblock":              {fn: (*Server).getBestBlock},
-	"getbestblockhash":          {fn: (*Server).getBestBlockHash},
-	"getblockcount":             {fn: (*Server).getBlockCount},
-	"getblockhash":              {fn: (*Server).getBlockHash},
-	"getblockheader":            {fn: (*Server).getBlockHeader},
-	"getblock":                  {fn: (*Server).getBlock},
-	"getcoinjoinsbyacct":        {fn: (*Server).getcoinjoinsbyacct},
-	"getcurrentnet":             {fn: (*Server).getCurrentNet},
-	"getinfo":                   {fn: (*Server).getInfo},
-	"getmasterpubkey":           {fn: (*Server).getMasterPubkey},
-	"getmultisigoutinfo":        {fn: (*Server).getMultisigOutInfo},
-	"getnewaddress":             {fn: (*Server).getNewAddress},
-	"getpeerinfo":               {fn: (*Server).getPeerInfo},
-	"getrawchangeaddress":       {fn: (*Server).getRawChangeAddress},
-	"getreceivedbyaccount":      {fn: (*Server).getReceivedByAccount},
-	"getreceivedbyaddress":      {fn: (*Server).getReceivedByAddress},
-	"getstakeinfo":              {fn: (*Server).getStakeInfo},
-	"gettickets":                {fn: (*Server).getTickets},
-	"gettransaction":            {fn: (*Server).getTransaction},
-	"gettxout":                  {fn: (*Server).getTxOut},
-	"getunconfirmedbalance":     {fn: (*Server).getUnconfirmedBalance},
-	"getvotechoices":            {fn: (*Server).getVoteChoices},
-	"getwalletfee":              {fn: (*Server).getWalletFee},
-	"help":                      {fn: (*Server).help},
-	"getcfilterv2":              {fn: (*Server).getCFilterV2},
-	"importcfiltersv2":          {fn: (*Server).importCFiltersV2},
-	"importprivkey":             {fn: (*Server).importPrivKey},
-	"importpubkey":              {fn: (*Server).importPubKey},
-	"importscript":              {fn: (*Server).importScript},
-	"importxpub":                {fn: (*Server).importXpub},
-	"listaccounts":              {fn: (*Server).listAccounts},
-	"listaddresstransactions":   {fn: (*Server).listAddressTransactions},
-	"listalltransactions":       {fn: (*Server).listAllTransactions},
-	"listlockunspent":           {fn: (*Server).listLockUnspent},
-	"listreceivedbyaccount":     {fn: (*Server).listReceivedByAccount},
-	"listreceivedbyaddress":     {fn: (*Server).listReceivedByAddress},
-	"listsinceblock":            {fn: (*Server).listSinceBlock},
-	"listtransactions":          {fn: (*Server).listTransactions},
-	"listunspent":               {fn: (*Server).listUnspent},
-	"lockaccount":               {fn: (*Server).lockAccount},
-	"lockunspent":               {fn: (*Server).lockUnspent},
-	"mixaccount":                {fn: (*Server).mixAccount},
-	"mixoutput":                 {fn: (*Server).mixOutput},
-	"purchaseticket":            {fn: (*Server).purchaseTicket},
-	"processunmanagedticket":    {fn: (*Server).processUnmanagedTicket},
-	"redeemmultisigout":         {fn: (*Server).redeemMultiSigOut},
-	"redeemmultisigouts":        {fn: (*Server).redeemMultiSigOuts},
-	"renameaccount":             {fn: (*Server).renameAccount},
-	"rescanwallet":              {fn: (*Server).rescanWallet},
-	"sendfrom":                  {fn: (*Server).sendFrom},
-	"sendfromtreasury":          {fn: (*Server).sendFromTreasury},
-	"sendmany":                  {fn: (*Server).sendMany},
-	"sendrawtransaction":        {fn: (*Server).sendRawTransaction},
-	"sendtoaddress":             {fn: (*Server).sendToAddress},
-	"sendtomultisig":            {fn: (*Server).sendToMultiSig},
-	"sendtotreasury":            {fn: (*Server).sendToTreasury},
-	"setaccountpassphrase":      {fn: (*Server).setAccountPassphrase},
-	"setdisapprovepercent":      {fn: (*Server).setDisapprovePercent},
-	"settreasurypolicy":         {fn: (*Server).setTreasuryPolicy},
-	"settspendpolicy":           {fn: (*Server).setTSpendPolicy},
-	"settxfee":                  {fn: (*Server).setTxFee},
-	"setvotechoice":             {fn: (*Server).setVoteChoice},
-	"signmessage":               {fn: (*Server).signMessage},
-	"signrawtransaction":        {fn: (*Server).signRawTransaction},
-	"signrawtransactions":       {fn: (*Server).signRawTransactions},
-	"spendoutputs":              {fn: (*Server).spendOutputs},
-	"sweepaccount":              {fn: (*Server).sweepAccount},
-	"syncstatus":                {fn: (*Server).syncStatus},
-	"ticketinfo":                {fn: (*Server).ticketInfo},
-	"treasurypolicy":            {fn: (*Server).treasuryPolicy},
-	"tspendpolicy":              {fn: (*Server).tspendPolicy},
-	"unlockaccount":             {fn: (*Server).unlockAccount},
-	"validateaddress":           {fn: (*Server).validateAddress},
-	"validatepredcp0005cf":      {fn: (*Server).validatePreDCP0005CF},
-	"verifymessage":             {fn: (*Server).verifyMessage},
-	"version":                   {fn: (*Server).version},
-	"walletinfo":                {fn: (*Server).walletInfo},
-	"walletislocked":            {fn: (*Server).walletIsLocked},
-	"walletlock":                {fn: (*Server).walletLock},
-	"walletpassphrase":          {fn: (*Server).walletPassphrase},
-	"walletpassphrasechange":    {fn: (*Server).walletPassphraseChange},
-	"walletpubpassphrasechange": {fn: (*Server).walletPubPassphraseChange},
+	"abandontransaction":               {fn: (*Server).abandonTransaction},
+	"accountaddressindex":              {fn: (*Server).accountAddressIndex},
+	"accountsyncaddressindex":          {fn: (*Server).accountSyncAddressIndex},
+	"accountunlocked":                  {fn: (*Server).accountUnlocked},
+	"addmultisigaddress":               {fn: (*Server).addMultiSigAddress},
+	"addtransaction":                   {fn: (*Server).addTransaction},
+	"auditreuse":                       {fn: (*Server).auditReuse},
+	"consolidate":                      {fn: (*Server).consolidate},
+	"createmultisig":                   {fn: (*Server).createMultiSig},
+	"createnewaccount":                 {fn: (*Server).createNewAccount},
+	"createauthorizedemission":         {fn: (*Server).createAuthorizedEmission},
+	"createrawtransaction":             {fn: (*Server).createRawTransaction},
+	"generateemissionkey":              {fn: (*Server).generateEmissionKey},
+	"importemissionkey":                {fn: (*Server).importEmissionKey},
+	"createsignature":                  {fn: (*Server).createSignature},
+	"debuglevel":                       {fn: (*Server).debugLevel},
+	"disapprovepercent":                {fn: (*Server).disapprovePercent},
+	"discoverusage":                    {fn: (*Server).discoverUsage},
+	"dumpprivkey":                      {fn: (*Server).dumpPrivKey},
+	"fundrawtransaction":               {fn: (*Server).fundRawTransaction},
+	"getaccount":                       {fn: (*Server).getAccount},
+	"getaccountaddress":                {fn: (*Server).getAccountAddress},
+	"getaddressesbyaccount":            {fn: (*Server).getAddressesByAccount},
+	"getbalance":                       {fn: (*Server).getBalance},
+	"getcoinbalance":                   {fn: (*Server).getCoinBalance},
+	"getbestblock":                     {fn: (*Server).getBestBlock},
+	"getbestblockhash":                 {fn: (*Server).getBestBlockHash},
+	"getblockcount":                    {fn: (*Server).getBlockCount},
+	"getblockhash":                     {fn: (*Server).getBlockHash},
+	"getblockheader":                   {fn: (*Server).getBlockHeader},
+	"getblock":                         {fn: (*Server).getBlock},
+	"getcoinjoinsbyacct":               {fn: (*Server).getcoinjoinsbyacct},
+	"getcurrentnet":                    {fn: (*Server).getCurrentNet},
+	"getinfo":                          {fn: (*Server).getInfo},
+	"getmasterpubkey":                  {fn: (*Server).getMasterPubkey},
+	"getmultisigoutinfo":               {fn: (*Server).getMultisigOutInfo},
+	"getnewaddress":                    {fn: (*Server).getNewAddress},
+	"getpeerinfo":                      {fn: (*Server).getPeerInfo},
+	"getrawchangeaddress":              {fn: (*Server).getRawChangeAddress},
+	"getreceivedbyaccount":             {fn: (*Server).getReceivedByAccount},
+	"getreceivedbyaddress":             {fn: (*Server).getReceivedByAddress},
+	"getstakeinfo":                     {fn: (*Server).getStakeInfo},
+	"gettickets":                       {fn: (*Server).getTickets},
+	"gettransaction":                   {fn: (*Server).getTransaction},
+	"gettxout":                         {fn: (*Server).getTxOut},
+	"getunconfirmedbalance":            {fn: (*Server).getUnconfirmedBalance},
+	"getvotechoices":                   {fn: (*Server).getVoteChoices},
+	"getvotefeeconsolidationaddress":   {fn: (*Server).getVoteFeeConsolidationAddress},
+	"getwalletfee":                     {fn: (*Server).getWalletFee},
+	"clearvotefeeconsolidationaddress": {fn: (*Server).clearVoteFeeConsolidationAddress},
+	"help":                             {fn: (*Server).help},
+	"getcfilterv2":                     {fn: (*Server).getCFilterV2},
+	"importcfiltersv2":                 {fn: (*Server).importCFiltersV2},
+	"importprivkey":                    {fn: (*Server).importPrivKey},
+	"importpubkey":                     {fn: (*Server).importPubKey},
+	"importscript":                     {fn: (*Server).importScript},
+	"importxpub":                       {fn: (*Server).importXpub},
+	"listaccounts":                     {fn: (*Server).listAccounts},
+	"listaddresstransactions":          {fn: (*Server).listAddressTransactions},
+	"listcointypes":                    {fn: (*Server).listCoinTypes},
+	"listalltransactions":              {fn: (*Server).listAllTransactions},
+	"listlockunspent":                  {fn: (*Server).listLockUnspent},
+	"listreceivedbyaccount":            {fn: (*Server).listReceivedByAccount},
+	"listreceivedbyaddress":            {fn: (*Server).listReceivedByAddress},
+	"listsinceblock":                   {fn: (*Server).listSinceBlock},
+	"listtransactions":                 {fn: (*Server).listTransactions},
+	"listunspent":                      {fn: (*Server).listUnspent},
+	"lockaccount":                      {fn: (*Server).lockAccount},
+	"lockunspent":                      {fn: (*Server).lockUnspent},
+	"mixaccount":                       {fn: (*Server).mixAccount},
+	"mixoutput":                        {fn: (*Server).mixOutput},
+	"purchaseticket":                   {fn: (*Server).purchaseTicket},
+	"processunmanagedticket":           {fn: (*Server).processUnmanagedTicket},
+	"redeemmultisigout":                {fn: (*Server).redeemMultiSigOut},
+	"redeemmultisigouts":               {fn: (*Server).redeemMultiSigOuts},
+	"renameaccount":                    {fn: (*Server).renameAccount},
+	"rescanwallet":                     {fn: (*Server).rescanWallet},
+	"sendfrom":                         {fn: (*Server).sendFrom},
+	"sendfromtreasury":                 {fn: (*Server).sendFromTreasury},
+	"sendmany":                         {fn: (*Server).sendMany},
+	"sendrawtransaction":               {fn: (*Server).sendRawTransaction},
+	"sendtoaddress":                    {fn: (*Server).sendToAddress},
+	"sendtomultisig":                   {fn: (*Server).sendToMultiSig},
+	"sendtotreasury":                   {fn: (*Server).sendToTreasury},
+	"sendtoburn":                       {fn: (*Server).sendToBurn},
+	"setaccountpassphrase":             {fn: (*Server).setAccountPassphrase},
+	"setdisapprovepercent":             {fn: (*Server).setDisapprovePercent},
+	"settreasurypolicy":                {fn: (*Server).setTreasuryPolicy},
+	"settspendpolicy":                  {fn: (*Server).setTSpendPolicy},
+	"settxfee":                         {fn: (*Server).setTxFee},
+	"setvotechoice":                    {fn: (*Server).setVoteChoice},
+	"setvotefeeconsolidationaddress":   {fn: (*Server).setVoteFeeConsolidationAddress},
+	"signmessage":                      {fn: (*Server).signMessage},
+	"signrawtransaction":               {fn: (*Server).signRawTransaction},
+	"signrawtransactions":              {fn: (*Server).signRawTransactions},
+	"spendoutputs":                     {fn: (*Server).spendOutputs},
+	"sweepaccount":                     {fn: (*Server).sweepAccount},
+	"syncstatus":                       {fn: (*Server).syncStatus},
+	"ticketinfo":                       {fn: (*Server).ticketInfo},
+	"treasurypolicy":                   {fn: (*Server).treasuryPolicy},
+	"tspendpolicy":                     {fn: (*Server).tspendPolicy},
+	"unlockaccount":                    {fn: (*Server).unlockAccount},
+	"validateaddress":                  {fn: (*Server).validateAddress},
+	"validatepredcp0005cf":             {fn: (*Server).validatePreDCP0005CF},
+	"verifymessage":                    {fn: (*Server).verifyMessage},
+	"version":                          {fn: (*Server).version},
+	"walletinfo":                       {fn: (*Server).walletInfo},
+	"walletislocked":                   {fn: (*Server).walletIsLocked},
+	"walletlock":                       {fn: (*Server).walletLock},
+	"walletpassphrase":                 {fn: (*Server).walletPassphrase},
+	"walletpassphrasechange":           {fn: (*Server).walletPassphraseChange},
+	"walletpubpassphrasechange":        {fn: (*Server).walletPubPassphraseChange},
 
 	// Unimplemented/unsupported RPCs which may be found in other
 	// cryptocurrency wallets.
@@ -594,9 +625,15 @@ func (s *Server) consolidate(ctx context.Context, icmd any) (any, error) {
 		}
 	}
 
+	// Get coin type (default to VAR if not specified)
+	ct := cointype.CoinTypeVAR
+	if cmd.CoinType != nil {
+		ct = cointype.CoinType(*cmd.CoinType)
+	}
+
 	// TODO In the future this should take the optional account and
 	// only consolidate UTXOs found within that account.
-	txHash, err := w.Consolidate(ctx, cmd.Inputs, account, changeAddr)
+	txHash, err := w.ConsolidateWithCoinType(ctx, cmd.Inputs, account, changeAddr, ct)
 	if err != nil {
 		return nil, err
 	}
@@ -711,7 +748,7 @@ func (s *Server) createRawTransaction(ctx context.Context, icmd any) (any, error
 				"New amount: %v", err)
 		}
 		// Ensure amount is in the valid range for monetary amounts.
-		if atomic <= 0 || atomic > dcrutil.MaxAmount {
+		if atomic <= 0 || atomic > dcrutil.Amount(cointype.MaxVARAmount) {
 			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
 				"Amount outside valid range: %v", atomic)
 		}
@@ -1040,7 +1077,7 @@ func (s *Server) getAddressesByAccount(ctx context.Context, icmd any) (any, erro
 
 // getBalance handles a getbalance request by returning the balance for an
 // account (wallet), or an error if the requested account does not
-// exist.
+// exist. Supports optional coin type filtering for dual-coin operations.
 func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.GetBalanceCmd)
 	w, ok := s.walletLoader.LoadedWallet()
@@ -1051,6 +1088,14 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 	minConf := int32(*cmd.MinConf)
 	if minConf < 0 {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "minconf must be non-negative")
+	}
+
+	// Validate coin type if specified
+	if cmd.CoinType != nil {
+		coinType := cointype.CoinType(*cmd.CoinType)
+		if err := validateCoinType(coinType); err != nil {
+			return nil, err
+		}
 	}
 
 	accountName := "*"
@@ -1064,6 +1109,72 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 	}
 
 	if accountName == "*" {
+		// If coin type is specified, filter by coin type
+		if cmd.CoinType != nil {
+			coinType := cointype.CoinType(*cmd.CoinType)
+			allBalances, err := w.AccountBalances(ctx, minConf)
+			if err != nil {
+				return nil, err
+			}
+
+			// Filter for specified coin type and convert to result format
+			result.Balances = make([]types.GetAccountBalanceResult, 0, len(allBalances))
+
+			var (
+				totImmatureCoinbase dcrutil.Amount
+				totImmatureStakegen dcrutil.Amount
+				totLocked           dcrutil.Amount
+				totSpendable        dcrutil.Amount
+				totUnconfirmed      dcrutil.Amount
+				totVotingAuthority  dcrutil.Amount
+				cumTot              dcrutil.Amount
+			)
+
+			for _, bal := range allBalances {
+				// Check if this account has balances for the requested coin type
+				if coinBal, exists := bal.CoinTypeBalances[coinType]; exists && (coinBal.Total > 0 || coinBal.Unconfirmed > 0) {
+					accountName, err := w.AccountName(ctx, bal.Account)
+					if err != nil {
+						if errors.Is(err, errors.NotExist) {
+							return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
+						}
+						return nil, err
+					}
+
+					totImmatureCoinbase += coinBal.ImmatureCoinbaseRewards
+					totImmatureStakegen += coinBal.ImmatureStakeGeneration
+					totLocked += coinBal.LockedByTickets
+					totSpendable += coinBal.Spendable
+					totUnconfirmed += coinBal.Unconfirmed
+					totVotingAuthority += coinBal.VotingAuthority
+					cumTot += coinBal.Total
+
+					json := types.GetAccountBalanceResult{
+						AccountName:             accountName,
+						ImmatureCoinbaseRewards: coinBal.ImmatureCoinbaseRewards.ToCoin(),
+						ImmatureStakeGeneration: coinBal.ImmatureStakeGeneration.ToCoin(),
+						LockedByTickets:         coinBal.LockedByTickets.ToCoin(),
+						Spendable:               coinBal.Spendable.ToCoin(),
+						Total:                   coinBal.Total.ToCoin(),
+						Unconfirmed:             coinBal.Unconfirmed.ToCoin(),
+						VotingAuthority:         coinBal.VotingAuthority.ToCoin(),
+					}
+					result.Balances = append(result.Balances, json)
+				}
+			}
+
+			result.TotalImmatureCoinbaseRewards = totImmatureCoinbase.ToCoin()
+			result.TotalImmatureStakeGeneration = totImmatureStakegen.ToCoin()
+			result.TotalLockedByTickets = totLocked.ToCoin()
+			result.TotalSpendable = totSpendable.ToCoin()
+			result.TotalUnconfirmed = totUnconfirmed.ToCoin()
+			result.TotalVotingAuthority = totVotingAuthority.ToCoin()
+			result.CumulativeTotal = cumTot.ToCoin()
+
+			return result, nil
+		}
+
+		// Default behavior (backward compatible): use existing AccountBalances for VAR
 		balances, err := w.AccountBalances(ctx, int32(*cmd.MinConf))
 		if err != nil {
 			return nil, err
@@ -1130,25 +1241,47 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 			return nil, err
 		}
 
-		bal, err := w.AccountBalance(ctx, account, int32(*cmd.MinConf))
-		if err != nil {
-			// Expect account lookup to succeed
-			if errors.Is(err, errors.NotExist) {
-				return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
+		// If coin type is specified, use coin-type specific balance for single account
+		if cmd.CoinType != nil {
+			coinType := cointype.CoinType(*cmd.CoinType)
+			coinBal, err := w.AccountBalanceByCoinType(ctx, account, coinType, minConf)
+			if err != nil {
+				return nil, err
 			}
-			return nil, err
+
+			json := types.GetAccountBalanceResult{
+				AccountName:             accountName,
+				ImmatureCoinbaseRewards: coinBal.ImmatureCoinbaseRewards.ToCoin(),
+				ImmatureStakeGeneration: coinBal.ImmatureStakeGeneration.ToCoin(),
+				LockedByTickets:         coinBal.LockedByTickets.ToCoin(),
+				Spendable:               coinBal.Spendable.ToCoin(),
+				Total:                   coinBal.Total.ToCoin(),
+				Unconfirmed:             coinBal.Unconfirmed.ToCoin(),
+				VotingAuthority:         coinBal.VotingAuthority.ToCoin(),
+			}
+			result.Balances = append(result.Balances, json)
+		} else {
+			// Default behavior (backward compatible): use existing AccountBalance for VAR
+			bal, err := w.AccountBalance(ctx, account, minConf)
+			if err != nil {
+				// Expect account lookup to succeed
+				if errors.Is(err, errors.NotExist) {
+					return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
+				}
+				return nil, err
+			}
+			json := types.GetAccountBalanceResult{
+				AccountName:             accountName,
+				ImmatureCoinbaseRewards: bal.ImmatureCoinbaseRewards.ToCoin(),
+				ImmatureStakeGeneration: bal.ImmatureStakeGeneration.ToCoin(),
+				LockedByTickets:         bal.LockedByTickets.ToCoin(),
+				Spendable:               bal.Spendable.ToCoin(),
+				Total:                   bal.Total.ToCoin(),
+				Unconfirmed:             bal.Unconfirmed.ToCoin(),
+				VotingAuthority:         bal.VotingAuthority.ToCoin(),
+			}
+			result.Balances = append(result.Balances, json)
 		}
-		json := types.GetAccountBalanceResult{
-			AccountName:             accountName,
-			ImmatureCoinbaseRewards: bal.ImmatureCoinbaseRewards.ToCoin(),
-			ImmatureStakeGeneration: bal.ImmatureStakeGeneration.ToCoin(),
-			LockedByTickets:         bal.LockedByTickets.ToCoin(),
-			Spendable:               bal.Spendable.ToCoin(),
-			Total:                   bal.Total.ToCoin(),
-			Unconfirmed:             bal.Unconfirmed.ToCoin(),
-			VotingAuthority:         bal.VotingAuthority.ToCoin(),
-		}
-		result.Balances = append(result.Balances, json)
 	}
 
 	return result, nil
@@ -1429,7 +1562,7 @@ func (s *Server) getBlock(ctx context.Context, icmd any) (any, error) {
 		powHash = blockHeader.PowHashV2()
 	}
 
-	sbitsFloat := float64(blockHeader.SBits) / dcrutil.AtomsPerCoin
+	sbitsFloat := float64(blockHeader.SBits) / cointype.AtomsPerVAR
 	blockReply := dcrdtypes.GetBlockVerboseResult{
 		Hash:          cmd.Hash,
 		PoWHash:       powHash.String(),
@@ -1905,7 +2038,10 @@ func (s *Server) getAccountAddress(ctx context.Context, icmd any) (any, error) {
 		}
 		return nil, err
 	}
-	addr, err := w.CurrentAddress(account)
+
+	// Get the current address and persist it to the database so it can be
+	// found when receiving transactions and appears in getaddressesbyaccount.
+	addr, err := w.CurrentAddressAndPersist(ctx, account)
 	if err != nil {
 		// Expect account lookup to succeed
 		if errors.Is(err, errors.NotExist) {
@@ -2215,6 +2351,142 @@ func (s *Server) createNewAccount(ctx context.Context, icmd any) (any, error) {
 	return nil, nil
 }
 
+// createAuthorizedEmission handles a createauthorizedemission request by creating a
+// cryptographically signed SKA emission transaction.
+func (s *Server) createAuthorizedEmission(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.CreateAuthorizedEmissionCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	// Get governance-defined parameters for this coin type
+	chainParams := w.ChainParams()
+
+	// Get SKA coin configuration from governance settings
+	skaConfig := chainParams.SKACoins[cointype.CoinType(cmd.CoinType)]
+	if skaConfig == nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"coin type %d is not configured in governance settings", cmd.CoinType)
+	}
+
+	if !skaConfig.Active {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"coin type %d is not active according to governance settings", cmd.CoinType)
+	}
+
+	// Get governance-defined emission addresses and amounts from chain configuration
+	emissionAddresses := skaConfig.EmissionAddresses
+	emissionAmounts := skaConfig.EmissionAmounts
+
+	// Validate governance configuration
+	if len(emissionAddresses) == 0 {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"no emission addresses configured for coin type %d - governance vote required", cmd.CoinType)
+	}
+
+	if len(emissionAddresses) != len(emissionAmounts) {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"emission addresses and amounts length mismatch for coin type %d", cmd.CoinType)
+	}
+
+	// Calculate and validate total amount
+	var totalAmount int64
+	for _, amount := range emissionAmounts {
+		if amount <= 0 {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"invalid emission amount %d for coin type %d", amount, cmd.CoinType)
+		}
+		totalAmount += amount
+	}
+
+	if totalAmount != skaConfig.MaxSupply {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"total emission amount %d does not match MaxSupply %d for coin type %d",
+			totalAmount, skaConfig.MaxSupply, cmd.CoinType)
+	}
+
+	// Unlock wallet for key operations
+	err := w.Unlock(ctx, []byte(cmd.Passphrase), nil)
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCWalletPassphraseIncorrect,
+			"incorrect passphrase: %v", err)
+	}
+
+	// Get emission private key for this coin type from wallet
+	emissionPrivKey, err := getEmissionKeyForCoinType(w, ctx, cointype.CoinType(cmd.CoinType), cmd.EmissionKeyName)
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCWallet,
+			"failed to get emission key: %v", err)
+	}
+
+	// Get current block height from wallet
+	_, currentHeight32 := w.MainChainTip(ctx)
+	currentHeight := int64(currentHeight32)
+
+	// Set nonce to 1 - only one emission is planned per coin type
+	// This can be enhanced later to retrieve the current nonce from blockchain
+	// via RPC if multiple emissions per coin type are needed
+	nonce := uint64(1)
+
+	// Create authorization structure (without signature initially)
+	auth := &chaincfg.SKAEmissionAuth{
+		EmissionKey: emissionPrivKey.PubKey(),
+		Nonce:       nonce,
+		CoinType:    cointype.CoinType(cmd.CoinType),
+		Amount:      totalAmount,
+		Height:      currentHeight,
+		Timestamp:   time.Now().Unix(),
+	}
+
+	// Create the emission transaction first (unsigned)
+	// We need to build the transaction before signing so we can sign the transaction hash
+	tx, err := createUnsignedSKAEmissionTransaction(
+		auth, emissionAddresses, emissionAmounts, w.ChainParams())
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+			"failed to create emission transaction: %v", err)
+	}
+
+	// SECURITY FIX: Sign the transaction hash, not the addresses/amounts
+	// This prevents miner redirect attacks
+	authHash, err := createEmissionAuthHashFromTx(tx, auth, currentHeight, w.ChainParams())
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+			"failed to create authorization hash: %v", err)
+	}
+
+	// Sign the authorization hash that includes the transaction
+	signature := ecdsa.Sign(emissionPrivKey, authHash[:])
+	auth.Signature = signature.Serialize()
+
+	// Now update the transaction with the signed authorization
+	authScript, err := createEmissionAuthScript(auth)
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+			"failed to create authorization script: %v", err)
+	}
+	tx.TxIn[0].SignatureScript = authScript
+
+	// Serialize transaction to hex
+	var txBuf bytes.Buffer
+	if err := tx.Serialize(&txBuf); err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+			"failed to serialize transaction: %v", err)
+	}
+
+	// Calculate transaction hash
+	txHash := tx.TxHash()
+
+	return &types.CreateAuthorizedEmissionResult{
+		Transaction:     hex.EncodeToString(txBuf.Bytes()),
+		TransactionHash: txHash.String(),
+		Nonce:           nonce,
+		TotalAmount:     totalAmount,
+		CoinType:        cmd.CoinType,
+	}, nil
+}
+
 // renameAccount handles a renameaccount request by renaming an account.
 // If the account does not exist an appropriate error will be returned.
 func (s *Server) renameAccount(ctx context.Context, icmd any) (any, error) {
@@ -2425,7 +2697,19 @@ func (s *Server) getReceivedByAddress(ctx context.Context, icmd any) (any, error
 	if err != nil {
 		return nil, err
 	}
-	total, err := w.TotalReceivedForAddr(ctx, addr, int32(*cmd.MinConf))
+	// Use coin type filter, defaulting to VAR (0) if not specified
+	// Default to VAR if no coin type specified
+	filterCoinType := cointype.CoinTypeVAR
+	if cmd.CoinType != nil {
+		filterCoinType = cointype.CoinType(*cmd.CoinType)
+		// Validate coin type
+		if !filterCoinType.IsValid() {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"invalid coin type %d: must be between 0 (VAR) and 255 (SKA)", *cmd.CoinType)
+		}
+	}
+
+	total, err := w.TotalReceivedForAddr(ctx, addr, int32(*cmd.MinConf), filterCoinType)
 	if err != nil {
 		if errors.Is(err, errors.NotExist) {
 			return nil, errAddressNotInWallet
@@ -2821,13 +3105,97 @@ func (s *Server) getVoteChoices(ctx context.Context, icmd any) (any, error) {
 }
 
 // getWalletFee returns the currently set tx fee for the requested wallet
+// with source indication (manual, rpc, or static).
 func (s *Server) getWalletFee(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.GetWalletFeeCmd)
 	w, ok := s.walletLoader.LoadedWallet()
 	if !ok {
 		return nil, errUnloadedWallet
 	}
 
-	return w.RelayFee().ToCoin(), nil
+	// Default to VAR (coin type 0) if not specified
+	coinType := cointype.CoinType(0)
+	if cmd.CoinType != nil {
+		coinType = cointype.CoinType(*cmd.CoinType)
+	}
+
+	// Get effective fee with source indication
+	fee, source, err := w.GetEffectiveFee(ctx, coinType)
+	if err != nil {
+		return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
+	}
+
+	return &types.GetWalletFeeResult{
+		Fee:    fee.ToCoin(),
+		Source: source,
+	}, nil
+}
+
+// getVoteFeeConsolidationAddress handles the getvotefeeconsolidationaddress command.
+func (s *Server) getVoteFeeConsolidationAddress(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.GetVoteFeeConsolidationAddressCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	// Call wallet method to get address
+	addr, err := w.GetVoteFeeConsolidationAddress(ctx, cmd.Account)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if this is a custom address or the default
+	hasCustom, err := w.HasCustomConsolidationAddress(ctx, cmd.Account)
+	if err != nil {
+		return nil, err
+	}
+
+	return types.GetVoteFeeConsolidationAddressResult{
+		Account:   cmd.Account,
+		Address:   addr.String(),
+		IsDefault: !hasCustom,
+	}, nil
+}
+
+// setVoteFeeConsolidationAddress handles the setvotefeeconsolidationaddress command.
+func (s *Server) setVoteFeeConsolidationAddress(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.SetVoteFeeConsolidationAddressCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	// Decode and validate the address
+	addr, err := decodeAddress(cmd.Address, w.ChainParams())
+	if err != nil {
+		return nil, err
+	}
+
+	// Call wallet method
+	err = w.SetVoteFeeConsolidationAddress(ctx, cmd.Account, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	return "Consolidation address set successfully", nil
+}
+
+// clearVoteFeeConsolidationAddress handles the clearvotefeeconsolidationaddress command.
+func (s *Server) clearVoteFeeConsolidationAddress(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.ClearVoteFeeConsolidationAddressCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	// Call wallet method
+	err := w.ClearVoteFeeConsolidationAddress(ctx, cmd.Account)
+	if err != nil {
+		return nil, err
+	}
+
+	return "Consolidation address cleared (using default)", nil
 }
 
 // These generators create the following global variables in this package:
@@ -3226,12 +3594,20 @@ func (s *Server) listAllTransactions(ctx context.Context, icmd any) (any, error)
 	return w.ListAllTransactions(ctx)
 }
 
-// listUnspent handles the listunspent command.
+// listUnspent handles the listunspent command with optional coin type filtering.
 func (s *Server) listUnspent(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.ListUnspentCmd)
 	w, ok := s.walletLoader.LoadedWallet()
 	if !ok {
 		return nil, errUnloadedWallet
+	}
+
+	// Validate coin type if specified
+	if cmd.CoinType != nil {
+		coinType := cointype.CoinType(*cmd.CoinType)
+		if err := validateCoinType(coinType); err != nil {
+			return nil, err
+		}
 	}
 
 	var addresses map[string]struct{}
@@ -3251,6 +3627,7 @@ func (s *Server) listUnspent(ctx context.Context, icmd any) (any, error) {
 	if cmd.Account != nil {
 		account = *cmd.Account
 	}
+
 	result, err := w.ListUnspent(ctx, int32(*cmd.MinConf), int32(*cmd.MaxConf), addresses, account)
 	if err != nil {
 		if errors.Is(err, errors.NotExist) {
@@ -3258,6 +3635,21 @@ func (s *Server) listUnspent(ctx context.Context, icmd any) (any, error) {
 		}
 		return nil, err
 	}
+
+	// Filter by coin type if specified
+	if cmd.CoinType != nil {
+		requestedCoinType := *cmd.CoinType
+		filteredResult := make([]*types.ListUnspentResult, 0)
+
+		for _, unspent := range result {
+			if unspent.CoinType == requestedCoinType {
+				filteredResult = append(filteredResult, unspent)
+			}
+		}
+
+		return filteredResult, nil
+	}
+
 	return result, nil
 }
 
@@ -3533,6 +3925,30 @@ func makeOutputs(pairs map[string]dcrutil.Amount, chainParams *chaincfg.Params) 
 	return outputs, nil
 }
 
+// makeOutputsWithCoinType creates transaction outputs with specified coin type for dual-coin support.
+func makeOutputsWithCoinType(pairs map[string]dcrutil.Amount, chainParams *chaincfg.Params, coinType cointype.CoinType) ([]*wire.TxOut, error) {
+	outputs := make([]*wire.TxOut, 0, len(pairs))
+	for addrStr, amt := range pairs {
+		if amt < 0 {
+			return nil, errNeedPositiveAmount
+		}
+		addr, err := decodeAddress(addrStr, chainParams)
+		if err != nil {
+			return nil, err
+		}
+
+		vers, pkScript := addr.PaymentScript()
+
+		outputs = append(outputs, &wire.TxOut{
+			Value:    int64(amt),
+			PkScript: pkScript,
+			Version:  vers,
+			CoinType: coinType, // Dual-coin support: specify coin type
+		})
+	}
+	return outputs, nil
+}
+
 // sendPairs creates and sends payment transactions.
 // It returns the transaction hash in string format upon success
 // All errors are returned in dcrjson.RPCError format
@@ -3555,6 +3971,43 @@ func (s *Server) sendPairs(ctx context.Context, w *wallet.Wallet, amounts map[st
 	if err != nil {
 		return "", err
 	}
+	txSha, err := w.SendOutputs(ctx, outputs, account, changeAccount, minconf)
+	if err != nil {
+		if errors.Is(err, errors.Locked) {
+			return "", errWalletUnlockNeeded
+		}
+		if errors.Is(err, errors.InsufficientBalance) {
+			return "", rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
+		}
+		return "", err
+	}
+
+	return txSha.String(), nil
+}
+
+// sendPairsWithCoinType creates and sends payment transactions with coin type support.
+// It extends sendPairs to handle dual-coin transactions (VAR and SKA).
+func (s *Server) sendPairsWithCoinType(ctx context.Context, w *wallet.Wallet, amounts map[string]dcrutil.Amount, account uint32, minconf int32, coinType cointype.CoinType) (string, error) {
+	changeAccount := account
+	if s.cfg.MixingEnabled && s.cfg.MixAccount != "" && s.cfg.MixChangeAccount != "" {
+		mixAccount, err := w.AccountNumber(ctx, s.cfg.MixAccount)
+		if err != nil {
+			return "", err
+		}
+		if account == mixAccount {
+			changeAccount, err = w.AccountNumber(ctx, s.cfg.MixChangeAccount)
+			if err != nil {
+				return "", err
+			}
+		}
+	}
+
+	outputs, err := makeOutputsWithCoinType(amounts, w.ChainParams(), coinType)
+	if err != nil {
+		return "", err
+	}
+
+	// Use existing SendOutputs method (coin type is embedded in outputs)
 	txSha, err := w.SendOutputs(ctx, outputs, account, changeAccount, minconf)
 	if err != nil {
 		if errors.Is(err, errors.Locked) {
@@ -4434,6 +4887,15 @@ func (s *Server) sendFrom(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
+	// Validate coin type if specified
+	var coinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR for backward compatibility
+	if cmd.CoinType != nil {
+		coinType = cointype.CoinType(*cmd.CoinType)
+		if err := validateCoinType(coinType); err != nil {
+			return nil, err
+		}
+	}
+
 	// Transaction comments are not yet supported.  Error instead of
 	// pretending to save them.
 	if !isNilOrEmpty(cmd.Comment) || !isNilOrEmpty(cmd.CommentTo) {
@@ -4462,7 +4924,7 @@ func (s *Server) sendFrom(ctx context.Context, icmd any) (any, error) {
 		cmd.ToAddress: amt,
 	}
 
-	return s.sendPairs(ctx, w, pairs, account, minConf)
+	return s.sendPairsWithCoinType(ctx, w, pairs, account, minConf, coinType)
 }
 
 // sendMany handles a sendmany RPC request by creating a new transaction
@@ -4511,12 +4973,21 @@ func (s *Server) sendMany(ctx context.Context, icmd any) (any, error) {
 // transaction spending unspent transaction outputs for a wallet to another
 // payment address.  Leftover inputs not sent to the payment address or a fee
 // for the miner are sent back to a new address in the wallet.  Upon success,
-// the TxID for the created transaction is returned.
+// the TxID for the created transaction is returned. Supports optional coin type.
 func (s *Server) sendToAddress(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.SendToAddressCmd)
 	w, ok := s.walletLoader.LoadedWallet()
 	if !ok {
 		return nil, errUnloadedWallet
+	}
+
+	// Validate coin type if specified
+	var coinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR for backward compatibility
+	if cmd.CoinType != nil {
+		coinType = cointype.CoinType(*cmd.CoinType)
+		if err := validateCoinType(coinType); err != nil {
+			return nil, err
+		}
 	}
 
 	// Transaction comments are not yet supported.  Error instead of
@@ -4541,7 +5012,7 @@ func (s *Server) sendToAddress(ctx context.Context, icmd any) (any, error) {
 	}
 
 	// sendtoaddress always spends from the default account, this matches bitcoind
-	return s.sendPairs(ctx, w, pairs, udb.DefaultAccountNum, 1)
+	return s.sendPairsWithCoinType(ctx, w, pairs, udb.DefaultAccountNum, 1, coinType)
 }
 
 // sendToMultiSig handles a sendtomultisig RPC request by creating a new
@@ -4669,6 +5140,100 @@ func (s *Server) sendFromTreasury(ctx context.Context, icmd any) (any, error) {
 	return s.sendOutputsFromTreasury(ctx, w, *cmd)
 }
 
+// sendToBurn handles a sendtoburn RPC request by creating a new transaction
+// that permanently burns (destroys) SKA coins by sending them to a provably
+// unspendable OP_RETURN output. This operation is IRREVERSIBLE.
+// Only SKA coin types (1-255) can be burned; VAR coins cannot be burned.
+// Upon success, the TxID for the created burn transaction is returned.
+func (s *Server) sendToBurn(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.SendToBurnCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	// Validate coin type - must be SKA (1-255), not VAR (0)
+	coinType := cointype.CoinType(cmd.CoinType)
+	if err := validateCoinType(coinType); err != nil {
+		return nil, err
+	}
+	if !coinType.IsSKA() {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"cannot burn VAR coins (coin type 0); only SKA coins (1-255) can be burned")
+	}
+
+	// Parse and validate amount
+	amt, err := dcrutil.NewAmount(cmd.Amount)
+	if err != nil {
+		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
+	}
+	if amt <= 0 {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
+	}
+
+	// Temporarily unlock wallet with provided passphrase
+	passphrase := []byte(cmd.Passphrase)
+	defer func() {
+		for i := range passphrase {
+			passphrase[i] = 0
+		}
+	}()
+
+	err = w.Unlock(ctx, passphrase, nil)
+	if err != nil {
+		return nil, rpcError(dcrjson.ErrRPCWalletUnlockNeeded, err)
+	}
+
+	// Create the burn script for this coin type
+	params := w.ChainParams()
+	burnScript, err := params.CreateSKABurnScript(coinType)
+	if err != nil {
+		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
+	}
+
+	// Create the burn output with coin type and burn script
+	outputs := []*wire.TxOut{
+		{
+			Value:    int64(amt),
+			CoinType: coinType,
+			Version:  wire.DefaultPkScriptVersion,
+			PkScript: burnScript,
+		},
+	}
+
+	// Send the transaction - burning always spends from default account
+	account := uint32(udb.DefaultAccountNum)
+	changeAccount := account
+	minConf := int32(1)
+
+	// Handle mixing account change routing if enabled
+	if s.cfg.MixingEnabled {
+		mixAccount, err := w.AccountNumber(ctx, s.cfg.MixAccount)
+		if err != nil {
+			return nil, err
+		}
+		if account == mixAccount {
+			changeAccount, err = w.AccountNumber(ctx, s.cfg.MixChangeAccount)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	txHash, err := w.SendOutputs(ctx, outputs, account, changeAccount, minConf)
+	if err != nil {
+		if errors.Is(err, errors.Locked) {
+			return nil, errWalletUnlockNeeded
+		}
+		if errors.Is(err, errors.InsufficientBalance) {
+			return nil, rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
+		}
+		return nil, err
+	}
+
+	return txHash.String(), nil
+}
+
 // setTxFee sets the transaction fee per kilobyte added to transactions.
 func (s *Server) setTxFee(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.SetTxFeeCmd)
@@ -4686,7 +5251,22 @@ func (s *Server) setTxFee(ctx context.Context, icmd any) (any, error) {
 	if err != nil {
 		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
 	}
-	w.SetRelayFee(relayFee)
+
+	// Default to VAR (coin type 0) if not specified
+	coinType := cointype.CoinType(0)
+	if cmd.CoinType != nil {
+		coinType = cointype.CoinType(*cmd.CoinType)
+	}
+
+	// If amount is 0, clear manual override to use RPC dynamic fees
+	if cmd.Amount == 0 {
+		w.ClearManualFee(coinType)
+		// A boolean true result is returned upon success.
+		return true, nil
+	}
+
+	// Set manual fee override for the specified coin type
+	w.SetManualFee(coinType, relayFee)
 
 	// A boolean true result is returned upon success.
 	return true, nil
@@ -5772,4 +6352,669 @@ func (s *Server) getcoinjoinsbyacct(ctx context.Context, icmd any) (any, error) 
 	}
 
 	return acctNameCoinjoinSum, nil
+}
+
+// getCoinBalance handles a getcoinbalance request by returning the balance
+// for a specific coin type (VAR or SKA) with detailed breakdown.
+func (s *Server) getCoinBalance(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.GetCoinBalanceCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	coinType := cointype.CoinType(cmd.CoinType)
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+		if minConf < 0 {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "minconf must be non-negative")
+		}
+	}
+
+	// Validate coin type range
+	if err := validateCoinType(coinType); err != nil {
+		return nil, err
+	}
+
+	accountName := "*"
+	if cmd.Account != nil {
+		accountName = *cmd.Account
+	}
+
+	blockHash, _ := w.MainChainTip(ctx)
+
+	if accountName == "*" {
+		// Get total balance for this coin type across all accounts
+		totalBalance, err := w.TotalBalanceByCoinType(ctx, coinType, minConf)
+		if err != nil {
+			return nil, err
+		}
+
+		// Get per-account breakdown
+		allBalances, err := w.AccountBalances(ctx, minConf)
+		if err != nil {
+			return nil, err
+		}
+
+		result := types.GetCoinBalanceResult{
+			CoinType:                     uint8(coinType),
+			BlockHash:                    blockHash.String(),
+			TotalImmatureCoinbaseRewards: totalBalance.ImmatureCoinbaseRewards.ToCoin(),
+			TotalImmatureStakeGeneration: totalBalance.ImmatureStakeGeneration.ToCoin(),
+			TotalLockedByTickets:         totalBalance.LockedByTickets.ToCoin(),
+			TotalSpendable:               totalBalance.Spendable.ToCoin(),
+			TotalUnconfirmed:             totalBalance.Unconfirmed.ToCoin(),
+			TotalVotingAuthority:         totalBalance.VotingAuthority.ToCoin(),
+			CumulativeTotal:              totalBalance.Total.ToCoin(),
+		}
+
+		// Add per-account breakdown
+		result.Balances = make([]types.GetCoinAccountBalanceResult, 0)
+		for _, balance := range allBalances {
+			if coinBalance, exists := balance.CoinTypeBalances[coinType]; exists && coinBalance.Total > 0 {
+				accountName, err := w.AccountName(ctx, balance.Account)
+				if err != nil {
+					if errors.Is(err, errors.NotExist) {
+						return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
+					}
+					return nil, err
+				}
+
+				result.Balances = append(result.Balances, types.GetCoinAccountBalanceResult{
+					AccountName:             accountName,
+					CoinType:                uint8(coinType),
+					ImmatureCoinbaseRewards: coinBalance.ImmatureCoinbaseRewards.ToCoin(),
+					ImmatureStakeGeneration: coinBalance.ImmatureStakeGeneration.ToCoin(),
+					LockedByTickets:         coinBalance.LockedByTickets.ToCoin(),
+					Spendable:               coinBalance.Spendable.ToCoin(),
+					Total:                   coinBalance.Total.ToCoin(),
+					Unconfirmed:             coinBalance.Unconfirmed.ToCoin(),
+					VotingAuthority:         coinBalance.VotingAuthority.ToCoin(),
+				})
+			}
+		}
+
+		return result, nil
+	} else {
+		// Single account query
+		account, err := w.AccountNumber(ctx, accountName)
+		if err != nil {
+			if errors.Is(err, errors.NotExist) {
+				return nil, errAccountNotFound
+			}
+			return nil, err
+		}
+
+		coinBalance, err := w.AccountBalanceByCoinType(ctx, account, coinType, minConf)
+		if err != nil {
+			return nil, err
+		}
+
+		result := types.GetCoinBalanceResult{
+			CoinType:                     uint8(coinType),
+			BlockHash:                    blockHash.String(),
+			TotalImmatureCoinbaseRewards: coinBalance.ImmatureCoinbaseRewards.ToCoin(),
+			TotalImmatureStakeGeneration: coinBalance.ImmatureStakeGeneration.ToCoin(),
+			TotalLockedByTickets:         coinBalance.LockedByTickets.ToCoin(),
+			TotalSpendable:               coinBalance.Spendable.ToCoin(),
+			TotalUnconfirmed:             coinBalance.Unconfirmed.ToCoin(),
+			TotalVotingAuthority:         coinBalance.VotingAuthority.ToCoin(),
+			CumulativeTotal:              coinBalance.Total.ToCoin(),
+			Balances: []types.GetCoinAccountBalanceResult{{
+				AccountName:             accountName,
+				CoinType:                uint8(coinType),
+				ImmatureCoinbaseRewards: coinBalance.ImmatureCoinbaseRewards.ToCoin(),
+				ImmatureStakeGeneration: coinBalance.ImmatureStakeGeneration.ToCoin(),
+				LockedByTickets:         coinBalance.LockedByTickets.ToCoin(),
+				Spendable:               coinBalance.Spendable.ToCoin(),
+				Total:                   coinBalance.Total.ToCoin(),
+				Unconfirmed:             coinBalance.Unconfirmed.ToCoin(),
+				VotingAuthority:         coinBalance.VotingAuthority.ToCoin(),
+			}},
+		}
+
+		return result, nil
+	}
+}
+
+// listCoinTypes handles a listcointypes request by returning all coin types
+// that have non-zero balances in the wallet with balance information.
+func (s *Server) listCoinTypes(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.ListCoinTypesCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+		if minConf < 0 {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "minconf must be non-negative")
+		}
+	}
+
+	// Get list of active coin types from wallet
+	coinTypes, err := w.ListCoinTypes(ctx, minConf)
+	if err != nil {
+		return nil, err
+	}
+
+	result := types.ListCoinTypesResult{
+		CoinTypes: make([]types.CoinTypeInfo, 0, len(coinTypes)),
+	}
+
+	// Get balance for each coin type and create info
+	for _, coinType := range coinTypes {
+		balance, err := w.TotalBalanceByCoinType(ctx, coinType, minConf)
+		if err != nil {
+			return nil, err
+		}
+
+		// Generate human-readable name
+		var name string
+		if coinType == cointype.CoinTypeVAR {
+			name = "VAR"
+		} else {
+			name = fmt.Sprintf("SKA-%d", coinType)
+		}
+
+		info := types.CoinTypeInfo{
+			CoinType: uint8(coinType),
+			Name:     name,
+			Balance:  balance.Spendable.ToCoin(),
+		}
+
+		result.CoinTypes = append(result.CoinTypes, info)
+	}
+
+	return result, nil
+}
+
+// getEmissionKeyForCoinType retrieves a stored emission key by name and validates
+// it matches the governance-approved public key for the specified coin type.
+func getEmissionKeyForCoinType(w *wallet.Wallet, ctx context.Context, coinType cointype.CoinType, keyName string) (*secp256k1.PrivateKey, error) {
+	// Retrieve emission key by name from wallet database
+	privateKey, err := retrieveEmissionKeyByName(w, ctx, keyName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve emission key %s: %v", keyName, err)
+	}
+
+	// Validate that this key matches the governance-approved public key for this coin type
+	chainParams := w.ChainParams()
+	authorizedKey := chainParams.GetSKAEmissionKey(coinType)
+	if authorizedKey == nil {
+		return nil, fmt.Errorf("no emission key configured for coin type %d in governance settings", coinType)
+	}
+
+	publicKey := privateKey.PubKey()
+	if !bytes.Equal(publicKey.SerializeCompressed(), authorizedKey.SerializeCompressed()) {
+		return nil, fmt.Errorf("stored key %s does not match governance-approved public key for coin type %d", keyName, coinType)
+	}
+
+	return privateKey, nil
+}
+
+// createEmissionAuthHashFromTx creates the authorization hash for SKA emission signing.
+// SECURITY: This function creates a hash that binds the signature to:
+// - The exact transaction outputs (preventing miner redirect attacks)
+// - The network ID (preventing cross-network replay)
+// - The coin type, nonce, and block height
+func createEmissionAuthHashFromTx(tx *wire.MsgTx, auth *chaincfg.SKAEmissionAuth,
+	_ int64, chainParams *chaincfg.Params) ([32]byte, error) {
+
+	// Compute the transaction hash using no-witness serialization
+	// This ensures the signature binds to the exact outputs
+	txBytes, err := tx.BytesPrefix()
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("failed to serialize transaction: %w", err)
+	}
+	txHash := sha256.Sum256(txBytes)
+
+	// Build the domain-separated signing message
+	// Format: "SKA-EMIT-V2" || netID || coinType || nonce || blockHeight || txHash
+	var msgBuf bytes.Buffer
+
+	// Domain separator to prevent signature reuse in other contexts
+	msgBuf.WriteString("SKA-EMIT-V2")
+
+	// Network ID for replay protection across networks
+	if err := binary.Write(&msgBuf, binary.LittleEndian, uint32(chainParams.Net)); err != nil {
+		return [32]byte{}, fmt.Errorf("failed to write network ID: %w", err)
+	}
+
+	// Coin type
+	msgBuf.WriteByte(byte(auth.CoinType))
+
+	// Nonce for replay protection within network
+	if err := binary.Write(&msgBuf, binary.LittleEndian, auth.Nonce); err != nil {
+		return [32]byte{}, fmt.Errorf("failed to write nonce: %w", err)
+	}
+
+	// Use auth.Height (signed by emitter) instead of current blockHeight
+	// This allows broadcasting to mempool and inclusion at any valid height within window
+	if err := binary.Write(&msgBuf, binary.LittleEndian, uint64(auth.Height)); err != nil {
+		return [32]byte{}, fmt.Errorf("failed to write authorization height: %w", err)
+	}
+
+	// Transaction hash - this binds the signature to exact outputs
+	msgBuf.Write(txHash[:])
+
+	// Create the final message hash
+	return sha256.Sum256(msgBuf.Bytes()), nil
+}
+
+// createUnsignedSKAEmissionTransaction creates an unsigned SKA emission transaction.
+// The transaction will be signed separately after creation to bind the signature
+// to the transaction hash (preventing miner redirect attacks).
+func createUnsignedSKAEmissionTransaction(auth *chaincfg.SKAEmissionAuth,
+	emissionAddresses []string, amounts []int64, chainParams *chaincfg.Params) (*wire.MsgTx, error) {
+
+	// Validate authorization structure
+	if auth == nil {
+		return nil, fmt.Errorf("SKA emission authorization required")
+	}
+
+	if auth.EmissionKey == nil {
+		return nil, fmt.Errorf("SKA emission key required")
+	}
+
+	// Note: Signature is not required here since this creates an unsigned transaction
+	// The signature will be added after the transaction is created
+
+	// Validate coin type
+	if auth.CoinType < 1 || auth.CoinType > 255 {
+		return nil, fmt.Errorf("invalid SKA coin type: %d", auth.CoinType)
+	}
+
+	// Check if emission is authorized for this coin type
+	authorizedKey := chainParams.GetSKAEmissionKey(auth.CoinType)
+	if authorizedKey == nil {
+		return nil, fmt.Errorf("no emission key configured for coin type %d", auth.CoinType)
+	}
+
+	// Verify the provided key matches the authorized key
+	if !bytes.Equal(auth.EmissionKey.SerializeCompressed(),
+		authorizedKey.SerializeCompressed()) {
+		return nil, fmt.Errorf("unauthorized emission key for coin type %d", auth.CoinType)
+	}
+
+	// NOTE: Nonce checking is NOT performed during transaction creation
+	// because wallets cannot reliably know the chain state due to reorgs and lag.
+	// The nonce will be validated during block acceptance in dcrd
+	// which uses the actual blockchain state for proper replay protection.
+
+	// Validate emission amounts
+	if len(emissionAddresses) != len(amounts) {
+		return nil, fmt.Errorf("emission addresses and amounts length mismatch")
+	}
+
+	if len(emissionAddresses) == 0 {
+		return nil, fmt.Errorf("no emission addresses specified")
+	}
+
+	var totalAmount int64
+	for _, amount := range amounts {
+		if amount <= 0 {
+			return nil, fmt.Errorf("invalid emission amount: %d", amount)
+		}
+		totalAmount += amount
+	}
+
+	// Verify total matches authorization
+	if totalAmount != auth.Amount {
+		return nil, fmt.Errorf("total emission amount %d does not match authorization %d",
+			totalAmount, auth.Amount)
+	}
+
+	// Get the SKA coin config for this coin type and validate emission window
+	skaConfig, exists := chainParams.SKACoins[auth.CoinType]
+	if !exists {
+		return nil, fmt.Errorf("SKA coin type %d not configured", auth.CoinType)
+	}
+
+	// Verify emission height is within the emission window
+	emissionStart := int64(skaConfig.EmissionHeight)
+	emissionEnd := emissionStart + int64(skaConfig.EmissionWindow)
+	if auth.Height < emissionStart || auth.Height > emissionEnd {
+		return nil, fmt.Errorf("emission height %d is outside emission window [%d, %d] for coin type %d",
+			auth.Height, emissionStart, emissionEnd, auth.CoinType)
+	}
+
+	// Note: Signature verification is not done here since we're creating an unsigned transaction.
+	// The signature will be added after the transaction is created.
+
+	// Create the authorized emission transaction with Expiry set to window end
+	// This ensures automatic mempool cleanup if the emission window expires
+	tx := &wire.MsgTx{
+		SerType:  wire.TxSerializeFull,
+		Version:  1,
+		LockTime: 0,
+		Expiry:   uint32(emissionEnd),
+	}
+
+	// Create signature script with authorization data
+	authScript, err := createEmissionAuthScript(auth)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create authorization script: %w", err)
+	}
+
+	// Add null input for emission with full authorization script
+	tx.TxIn = append(tx.TxIn, &wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{
+			Hash:  chainhash.Hash{}, // All zeros
+			Index: 0xffffffff,       // Max value indicates null
+			Tree:  wire.TxTreeRegular,
+		},
+		SignatureScript: authScript,
+		Sequence:        0xffffffff,
+		BlockHeight:     wire.NullBlockHeight,
+		BlockIndex:      wire.NullBlockIndex,
+		ValueIn:         wire.NullValueIn,
+	})
+
+	// Add outputs for each emission address
+	for i, addressStr := range emissionAddresses {
+		addr, err := stdaddr.DecodeAddress(addressStr, chainParams)
+		if err != nil {
+			return nil, fmt.Errorf("invalid emission address %s: %w", addressStr, err)
+		}
+
+		// Create script for the address
+		_, pkScript := addr.PaymentScript()
+
+		// Add SKA output with specific coin type
+		tx.TxOut = append(tx.TxOut, &wire.TxOut{
+			Value:    amounts[i],
+			CoinType: auth.CoinType, // Use authorized coin type
+			Version:  0,
+			PkScript: pkScript,
+		})
+	}
+
+	return tx, nil
+}
+
+// createEmissionAuthScript creates the authorization script for SKA emission input.
+// Format: [SKA_marker:4][auth_version:1][nonce:8][coin_type:1][amount:8][height:8][pubkey:33][sig_len:1][signature:var]
+func createEmissionAuthScript(auth *chaincfg.SKAEmissionAuth) ([]byte, error) {
+	var script bytes.Buffer
+
+	// Standard SKA emission marker
+	script.Write([]byte{0x01, 0x53, 0x4b, 0x41}) // "SKA" marker
+
+	// Authorization data
+	script.WriteByte(0x02) // Auth version
+
+	// Nonce (8 bytes)
+	nonceBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(nonceBytes, auth.Nonce)
+	script.Write(nonceBytes)
+
+	// Coin type (1 byte)
+	script.WriteByte(uint8(auth.CoinType))
+
+	// Amount (8 bytes) - NEW FIELD
+	amountBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(amountBytes, uint64(auth.Amount))
+	script.Write(amountBytes)
+
+	// Height (8 bytes) - NEW FIELD
+	heightBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(heightBytes, uint64(auth.Height))
+	script.Write(heightBytes)
+
+	// Public key (33 bytes compressed)
+	pubKeyBytes := auth.EmissionKey.SerializeCompressed()
+	script.Write(pubKeyBytes)
+
+	// Signature length and signature
+	script.WriteByte(uint8(len(auth.Signature)))
+	script.Write(auth.Signature)
+
+	return script.Bytes(), nil
+}
+
+// generateEmissionKey handles a generateemissionkey request by creating a new private key
+// for SKA emission authorization (primary flow - key exists before governance).
+func (s *Server) generateEmissionKey(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.GenerateEmissionKeyCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	// Validate coin type if provided (optional parameter)
+	if cmd.CoinType != nil && (*cmd.CoinType < 1 || *cmd.CoinType > 255) {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"coin type must be between 1 and 255 (SKA types)")
+	}
+
+	// Validate key name
+	if cmd.KeyName == "" {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"key name cannot be empty")
+	}
+
+	// Check if wallet is unlocked (must be unlocked via walletpassphrase command)
+	if w.Locked() {
+		return nil, rpcErrorf(dcrjson.ErrRPCWalletUnlockNeeded,
+			"wallet must be unlocked with walletpassphrase command before generating emission keys")
+	}
+
+	// Generate new private key for emission
+	privateKey, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+			"failed to generate private key: %v", err)
+	}
+
+	publicKey := privateKey.PubKey()
+
+	// Store the emission key in wallet database (coin-type agnostic)
+	err = storeGeneratedEmissionKey(w, ctx, cmd.KeyName, privateKey)
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCWallet,
+			"failed to store emission key: %v", err)
+	}
+
+	// Encrypt the private key with the provided passphrase for backup
+	encryptedPrivateKey, err := encryptPrivateKeyWithPassphrase(privateKey, cmd.Passphrase)
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+			"failed to encrypt private key: %v", err)
+	}
+
+	// Prepare result with optional cointype
+	result := &types.GenerateEmissionKeyResult{
+		Success:             true,
+		KeyName:             cmd.KeyName,
+		PublicKey:           hex.EncodeToString(publicKey.SerializeCompressed()),
+		EncryptedPrivateKey: encryptedPrivateKey,
+	}
+	if cmd.CoinType != nil {
+		result.CoinType = *cmd.CoinType
+	}
+
+	return result, nil
+}
+
+// importEmissionKey handles an importemissionkey request by storing a private key
+// used for SKA emission authorization in the wallet database (emergency/recovery only).
+func (s *Server) importEmissionKey(ctx context.Context, icmd any) (any, error) {
+	cmd := icmd.(*types.ImportEmissionKeyCmd)
+	w, ok := s.walletLoader.LoadedWallet()
+	if !ok {
+		return nil, errUnloadedWallet
+	}
+
+	// Validate coin type if provided (optional parameter)
+	if cmd.CoinType != nil && (*cmd.CoinType < 1 || *cmd.CoinType > 255) {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"coin type must be between 1 and 255 (SKA types)")
+	}
+
+	// Validate key name
+	if cmd.KeyName == "" {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"key name cannot be empty")
+	}
+
+	// Parse private key - handle both encrypted and plain hex formats
+	var privateKey *secp256k1.PrivateKey
+	var err error
+
+	if strings.HasPrefix(cmd.PrivateKey, "aes256gcm:") {
+		// Encrypted format - decrypt with provided passphrase
+		privateKey, err = decryptPrivateKeyWithPassphrase(cmd.PrivateKey, cmd.Passphrase)
+		if err != nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"failed to decrypt private key: %v", err)
+		}
+	} else {
+		// Plain hex format - backward compatibility
+		privateKeyBytes, err := hex.DecodeString(cmd.PrivateKey)
+		if err != nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"invalid private key hex: %v", err)
+		}
+		privateKey = secp256k1.PrivKeyFromBytes(privateKeyBytes)
+	}
+
+	publicKey := privateKey.PubKey()
+
+	// Note: Governance validation is deferred to createauthorizedemission
+	// This allows flexible key management - users can import any keys
+	// and validation happens only when attempting to create emission transactions
+
+	// Check if wallet is unlocked (must be unlocked via walletpassphrase command)
+	if w.Locked() {
+		return nil, rpcErrorf(dcrjson.ErrRPCWalletUnlockNeeded,
+			"wallet must be unlocked with walletpassphrase command before importing emission keys")
+	}
+
+	// Store the imported emission key in wallet database
+	// Note: Storage is cointype-agnostic, validation happens at emission time
+	err = storeGeneratedEmissionKey(w, ctx, cmd.KeyName, privateKey) // Use same storage as generated keys
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCWallet,
+			"failed to store emission key: %v", err)
+	}
+
+	// Prepare result with optional cointype
+	result := &types.ImportEmissionKeyResult{
+		Success:   true,
+		KeyName:   cmd.KeyName,
+		PublicKey: hex.EncodeToString(publicKey.SerializeCompressed()),
+	}
+	if cmd.CoinType != nil {
+		result.CoinType = *cmd.CoinType
+	}
+
+	return result, nil
+}
+
+// storeGeneratedEmissionKey stores a newly generated emission private key in the wallet database.
+// This key is coin-type agnostic - the same key can be used for multiple coin types if governance approves.
+func storeGeneratedEmissionKey(w *wallet.Wallet, ctx context.Context, keyName string, privateKey *secp256k1.PrivateKey) error {
+	// Store the emission key using the wallet's public method
+	return w.StoreEmissionKey(ctx, keyName, privateKey)
+}
+
+// retrieveEmissionKeyByName retrieves an emission private key by name from the wallet database.
+// This is coin-type agnostic - the caller must validate the key matches governance settings.
+func retrieveEmissionKeyByName(w *wallet.Wallet, ctx context.Context, keyName string) (*secp256k1.PrivateKey, error) {
+	// Retrieve the emission key using the wallet's public method
+	return w.RetrieveEmissionKey(ctx, keyName)
+}
+
+// encryptPrivateKeyWithPassphrase encrypts a private key with AES-256-GCM using a passphrase.
+// Returns format: "aes256gcm:IV:encrypted_private_key_hex"
+func encryptPrivateKeyWithPassphrase(privateKey *secp256k1.PrivateKey, passphrase string) (string, error) {
+	// Derive AES key from passphrase using SHA-256
+	keyHash := sha256.Sum256([]byte(passphrase))
+
+	// Create AES cipher
+	block, err := aes.NewCipher(keyHash[:])
+	if err != nil {
+		return "", fmt.Errorf("failed to create AES cipher: %v", err)
+	}
+
+	// Create GCM
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("failed to create GCM: %v", err)
+	}
+
+	// Generate random IV
+	iv := make([]byte, gcm.NonceSize())
+	if _, err := cryptorand.Read(iv); err != nil {
+		return "", fmt.Errorf("failed to generate IV: %v", err)
+	}
+
+	// Encrypt the private key
+	privateKeyBytes := privateKey.Serialize()
+	ciphertext := gcm.Seal(nil, iv, privateKeyBytes, nil)
+
+	// Format: aes256gcm:IV:encrypted_data
+	result := fmt.Sprintf("aes256gcm:%s:%s", hex.EncodeToString(iv), hex.EncodeToString(ciphertext))
+	return result, nil
+}
+
+// decryptPrivateKeyWithPassphrase decrypts a private key from AES-256-GCM format.
+// Expects format: "aes256gcm:IV:encrypted_private_key_hex"
+func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k1.PrivateKey, error) {
+	// Check if it's in encrypted format
+	if !strings.HasPrefix(encryptedKey, "aes256gcm:") {
+		return nil, fmt.Errorf("invalid encrypted key format, expected aes256gcm: prefix")
+	}
+
+	// Parse the encrypted key format
+	parts := strings.Split(encryptedKey, ":")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid encrypted key format, expected aes256gcm:IV:data")
+	}
+
+	// Decode IV and ciphertext
+	iv, err := hex.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid IV hex: %v", err)
+	}
+
+	ciphertext, err := hex.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid ciphertext hex: %v", err)
+	}
+
+	// Derive AES key from passphrase
+	keyHash := sha256.Sum256([]byte(passphrase))
+
+	// Create AES cipher
+	block, err := aes.NewCipher(keyHash[:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AES cipher: %v", err)
+	}
+
+	// Create GCM
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %v", err)
+	}
+
+	// Decrypt the private key
+	privateKeyBytes, err := gcm.Open(nil, iv, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt private key (wrong passphrase?): %v", err)
+	}
+
+	// Parse the private key
+	privateKey := secp256k1.PrivKeyFromBytes(privateKeyBytes)
+
+	// Clear sensitive data
+	for i := range privateKeyBytes {
+		privateKeyBytes[i] = 0
+	}
+
+	return privateKey, nil
 }

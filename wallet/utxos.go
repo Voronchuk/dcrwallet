@@ -13,6 +13,7 @@ import (
 	"decred.org/dcrwallet/v5/wallet/txauthor"
 	"decred.org/dcrwallet/v5/wallet/udb"
 	"decred.org/dcrwallet/v5/wallet/walletdb"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4/stdscript"
 	"github.com/decred/dcrd/wire"
@@ -23,6 +24,7 @@ import (
 type OutputSelectionPolicy struct {
 	Account               uint32
 	RequiredConfirmations int32
+	CoinType              cointype.CoinType // Required: transactions cannot mix coin types
 }
 
 func (p *OutputSelectionPolicy) meetsRequiredConfs(txHeight, curHeight int32) bool {
@@ -45,7 +47,7 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 
 		// TODO: actually stream outputs from the db instead of fetching
 		// all of them at once.
-		outputs, err := w.txStore.UnspentOutputs(dbtx)
+		outputs, err := w.txStore.UnspentOutputs(dbtx, policy.CoinType)
 		if err != nil {
 			return err
 		}
@@ -74,6 +76,11 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 				continue
 			}
 
+			// Filter by coin type - must match policy's coin type
+			if output.CoinType != policy.CoinType {
+				continue
+			}
+
 			// Stakebase isn't exposed by wtxmgr so those will be
 			// OutputKindNormal for now.
 			outputSource := OutputKindNormal
@@ -89,6 +96,7 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 					// only version 0 at time of writing.
 					Version:  0,
 					PkScript: output.PkScript,
+					CoinType: output.CoinType,
 				},
 				OutputKind:      outputSource,
 				ContainingBlock: BlockIdentity(output.Block),
@@ -127,8 +135,8 @@ func (w *Wallet) SelectInputs(ctx context.Context, targetAmount dcrutil.Amount, 
 			}
 		}
 
-		sourceImpl := w.txStore.MakeInputSource(dbtx, policy.Account,
-			policy.RequiredConfirmations, tipHeight, nil)
+		sourceImpl := w.txStore.MakeInputSourceWithCoinType(dbtx, policy.Account,
+			policy.RequiredConfirmations, tipHeight, nil, policy.CoinType)
 		var err error
 		inputDetail, err = sourceImpl.SelectInputs(targetAmount)
 		return err

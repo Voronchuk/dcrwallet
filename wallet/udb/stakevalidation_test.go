@@ -12,6 +12,7 @@ import (
 
 	_ "decred.org/dcrwallet/v5/wallet/internal/bdb"
 	"decred.org/dcrwallet/v5/wallet/walletdb"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	gcs2 "github.com/decred/dcrd/gcs/v4"
 	"github.com/decred/dcrd/wire"
@@ -53,7 +54,7 @@ func TestStakeInvalidationOfTip(t *testing.T) {
 	block3Header := g.generate(0)
 
 	block1Tx := wire.MsgTx{
-		TxOut: []*wire.TxOut{{Value: 2e8}},
+		TxOut: []*wire.TxOut{{Value: 2e8, CoinType: 0}}, // Explicit VAR = 0
 	}
 	block2Tx := wire.MsgTx{
 		TxIn: []*wire.TxIn{
@@ -65,7 +66,7 @@ func TestStakeInvalidationOfTip(t *testing.T) {
 				},
 			},
 		},
-		TxOut: []*wire.TxOut{{Value: 1e8}},
+		TxOut: []*wire.TxOut{{Value: 1e8, CoinType: 0}}, // Explicit VAR = 0
 	}
 	block1TxRec, err := NewTxRecordFromMsgTx(&block1Tx, time.Time{})
 	if err != nil {
@@ -127,7 +128,7 @@ func TestStakeInvalidationOfTip(t *testing.T) {
 			t.Errorf("Wrong balance: expected %v got %v",
 				dcrutil.Amount(block2Tx.TxOut[0].Value), bal)
 		}
-		credits, err := s.UnspentOutputs(dbtx)
+		credits, err := s.UnspentOutputs(dbtx, cointype.CoinTypeVAR)
 		if err != nil {
 			return err
 		}
@@ -160,10 +161,11 @@ func TestStakeInvalidationOfTip(t *testing.T) {
 		if err != nil {
 			return err
 		}
+
 		if bal.Total != dcrutil.Amount(block1Tx.TxOut[0].Value) {
 			t.Errorf("Wrong balance: expected %v got %v", dcrutil.Amount(block1Tx.TxOut[0].Value), bal)
 		}
-		credits, err = s.UnspentOutputs(dbtx)
+		credits, err = s.UnspentOutputs(dbtx, cointype.CoinTypeVAR)
 		if err != nil {
 			return err
 		}

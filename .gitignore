@@ -17,3 +17,14 @@ rpc/rpc_example/rpc_example
 
 # Temporary database files created by tests.
 wallet/udb/*.kv
+
+# Compiled test binaries
+*.test
+
+# Prevent binary files in RPC directories
+internal/rpc/*/dcrwallet
+
+# Internal
+WALLET_MAINNET_SETUP.md
+dcrwallet.sample.conf
+mainnet-wallet.conf

@@ -30,6 +30,10 @@ func TestThrottle(t *testing.T) {
 	for i := 0; i < cap(responses); i++ {
 		go func() {
 			r, err := http.Get(srv.URL)
+			if err != nil && r != nil {
+				r.Body.Close()
+				r = nil
+			}
 			responses <- resp{r, err}
 		}()
 	}
@@ -38,9 +42,13 @@ func TestThrottle(t *testing.T) {
 	for i := 0; i < cap(responses); i++ {
 		r := <-responses
 		if r.err != nil {
+			if r.resp != nil {
+				r.resp.Body.Close()
+			}
 			t.Fatal(r.err)
 		}
 		got[r.resp.StatusCode]++
+		r.resp.Body.Close()
 
 		if i == 0 {
 			close(busy)

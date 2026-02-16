@@ -48,6 +48,7 @@ import (
 	"github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/crypto/rand"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrutil/v4"
@@ -144,17 +145,6 @@ func decodeAddress(a string, params *chaincfg.Params) (stdaddr.Address, error) {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid address %v: %v", a, err)
 	}
 	return addr, nil
-}
-
-func decodeStakeAddress(s string, params *chaincfg.Params) (stdaddr.StakeAddress, error) {
-	a, err := decodeAddress(s, params)
-	if err != nil {
-		return nil, err
-	}
-	if sa, ok := a.(stdaddr.StakeAddress); ok {
-		return sa, nil
-	}
-	return nil, status.Errorf(codes.InvalidArgument, "invalid stake address %q", s)
 }
 
 func decodeHashes(in [][]byte) ([]*chainhash.Hash, error) {
@@ -1044,6 +1034,7 @@ func (s *walletServer) UnspentOutputs(req *pb.UnspentOutputsRequest, svr pb.Wall
 	policy := wallet.OutputSelectionPolicy{
 		Account:               req.Account,
 		RequiredConfirmations: req.RequiredConfirmations,
+		CoinType:              cointype.CoinTypeVAR, // Default to VAR for backward compatibility
 	}
 	inputDetail, err := s.wallet.SelectInputs(svr.Context(), dcrutil.Amount(req.TargetAmount), policy)
 	// Do not return errors to caller when there was insufficient spendable
@@ -1090,6 +1081,7 @@ func (s *walletServer) FundTransaction(ctx context.Context, req *pb.FundTransact
 	policy := wallet.OutputSelectionPolicy{
 		Account:               req.Account,
 		RequiredConfirmations: req.RequiredConfirmations,
+		CoinType:              cointype.CoinTypeVAR, // Default to VAR for backward compatibility
 	}
 	inputDetail, err := s.wallet.SelectInputs(ctx, dcrutil.Amount(req.TargetAmount), policy)
 	// Do not return errors to caller when there was insufficient spendable
@@ -2256,6 +2248,8 @@ func marshalTxType(walletTxType wallet.TransactionType) pb.TransactionDetails_Tr
 	case wallet.TransactionTypeRevocation:
 		return pb.TransactionDetails_REVOCATION
 	default:
+		// SSFee and other new transaction types fall through to REGULAR for
+		// backward compatibility with existing RPC clients.
 		return pb.TransactionDetails_REGULAR
 	}
 }

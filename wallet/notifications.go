@@ -16,6 +16,7 @@ import (
 	"decred.org/dcrwallet/v5/wallet/walletdb"
 	"github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/hdkeychain/v3"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
@@ -182,9 +183,27 @@ func makeTxSummary(dbtx walletdb.ReadTx, w *Wallet, details *udb.TxDetails) Tran
 
 func totalBalances(dbtx walletdb.ReadTx, w *Wallet, m map[uint32]dcrutil.Amount) error {
 	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-	unspent, err := w.txStore.UnspentOutputs(dbtx)
+	// Get unspent outputs for active coin types
+	var unspent []*udb.Credit
+
+	// Get VAR outputs (always active)
+	outputs, err := w.txStore.UnspentOutputs(dbtx, cointype.CoinTypeVAR)
 	if err != nil {
 		return err
+	}
+	unspent = append(unspent, outputs...)
+
+	// Get outputs for active SKA coin types only
+	if w.chainParams != nil && w.chainParams.SKACoins != nil {
+		for coinType, config := range w.chainParams.SKACoins {
+			if config.Active {
+				outputs, err := w.txStore.UnspentOutputs(dbtx, coinType)
+				if err != nil {
+					return err
+				}
+				unspent = append(unspent, outputs...)
+			}
+		}
 	}
 	for i := range unspent {
 		output := unspent[i]
@@ -206,8 +225,39 @@ func totalBalances(dbtx walletdb.ReadTx, w *Wallet, m map[uint32]dcrutil.Amount)
 func flattenBalanceMap(m map[uint32]dcrutil.Amount) []AccountBalance {
 	s := make([]AccountBalance, 0, len(m))
 	for k, v := range m {
-		s = append(s, AccountBalance{Account: k, TotalBalance: v})
+		s = append(s, AccountBalance{
+			Account:      k,
+			TotalBalance: v,
+			// Initialize empty CoinTypeBalances map for backward compatibility
+			CoinTypeBalances: make(map[cointype.CoinType]dcrutil.Amount),
+		})
 	}
+	return s
+}
+
+// flattenMultiCoinBalanceMap converts multi-coin balance map to AccountBalance slice
+func flattenMultiCoinBalanceMap(accountCoinBalances map[uint32]map[cointype.CoinType]dcrutil.Amount) []AccountBalance {
+	s := make([]AccountBalance, 0, len(accountCoinBalances))
+
+	for account, coinBalances := range accountCoinBalances {
+		accountBalance := AccountBalance{
+			Account:          account,
+			CoinTypeBalances: make(map[cointype.CoinType]dcrutil.Amount),
+		}
+
+		// Calculate total balance and populate coin type balances
+		for coinType, amount := range coinBalances {
+			accountBalance.CoinTypeBalances[coinType] = amount
+
+			// For backward compatibility, aggregate VAR balance as total
+			if coinType == cointype.CoinTypeVAR {
+				accountBalance.TotalBalance = amount
+			}
+		}
+
+		s = append(s, accountBalance)
+	}
+
 	return s
 }
 
@@ -424,11 +474,19 @@ const (
 	// TransactionTypeRevocation transaction type for all transactions that consume a
 	// ticket, but offer no stake base reward.
 	TransactionTypeRevocation
+
+	// TransactionTypeSSFee transaction type for stake fee distribution transactions
+	// that distribute non-VAR coin fees to voters.
+	// Note: This type is mapped to REGULAR in RPC responses for backward compatibility.
+	TransactionTypeSSFee
 )
 
 // TxTransactionType returns the correct TransactionType given a wire transaction
 func TxTransactionType(tx *wire.MsgTx) TransactionType {
-	if compat.IsEitherCoinBaseTx(tx) {
+	// Check for SSFee before coinbase since both have null inputs
+	if stake.IsSSFee(tx) {
+		return TransactionTypeSSFee
+	} else if compat.IsEitherCoinBaseTx(tx) {
 		return TransactionTypeCoinbase
 	} else if stake.IsSStx(tx) {
 		return TransactionTypeTicketPurchase
@@ -463,13 +521,37 @@ type TransactionSummaryOutput struct {
 	OutputScript []byte
 }
 
-// AccountBalance associates a total (zero confirmation) balance with an
-// account.  Balances for other minimum confirmation counts require more
-// expensive logic and it is not clear which minimums a client is interested in,
-// so they are not included.
+// AccountBalance associates balance information with an account for notification purposes.
+// This structure supports both legacy VAR-only notifications (TotalBalance field) and
+// new multi-coin notifications (CoinTypeBalances map) for the dual-coin system.
+//
+// The structure provides zero-confirmation balance data. Balances for other minimum
+// confirmation counts require more expensive logic and it is not clear which minimums
+// a client is interested in, so they are not included in notifications.
+//
+// Fields:
+//   - Account: The account number this balance notification relates to
+//   - TotalBalance: Legacy VAR total balance (maintained for backward compatibility)
+//   - CoinTypeBalances: Map of coin type to total balance for that coin type
+//     Key 0 = VAR balance, Keys 1-255 = SKA variant balances
+//
+// Example notification data:
+//
+//	AccountBalance{
+//	  Account: 0,
+//	  TotalBalance: 500000000, // 5 VAR (legacy field)
+//	  CoinTypeBalances: map[cointype.CoinType]dcrutil.Amount{
+//	    0: 500000000,   // 5 VAR
+//	    1: 1000000000,  // 10 SKA-1
+//	    2: 250000000,   // 2.5 SKA-2
+//	  }
+//	}
 type AccountBalance struct {
 	Account      uint32
-	TotalBalance dcrutil.Amount
+	TotalBalance dcrutil.Amount // VAR total balance (for backward compatibility)
+
+	// Multi-coin support: breakdown by coin type
+	CoinTypeBalances map[cointype.CoinType]dcrutil.Amount
 }
 
 // TransactionNotificationsClient receives TransactionNotifications from the
